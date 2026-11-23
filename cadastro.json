@@ -1,0 +1,14 @@
+{"ts": 1795396218.896, "componente": "cadastro", "id": 0, "metrica": "inicio", "valor": 1, "coordenador": "127.0.0.1:5001", "servidor_inicial": 0, "porta_controle": 6001}
+{"ts": 1795396252.679, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "NEWUSER_12_Arthur", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_NEWUSER_12"}
+{"ts": 1795396252.68, "componente": "cadastro", "id": 0, "metrica": "usuario_adicionado", "valor": 1, "usuario": 12, "nome": "Arthur"}
+{"ts": 1795396275.939, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "NEWUSER_1_Felipe Gomes", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_NEWUSER_1"}
+{"ts": 1795396275.939, "componente": "cadastro", "id": 0, "metrica": "usuario_adicionado", "valor": 1, "usuario": 1, "nome": "Felipe Gomes"}
+{"ts": 1795396275.963, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "NEWUSER_2_Isabela Oliveira", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_NEWUSER_2"}
+{"ts": 1795396275.963, "componente": "cadastro", "id": 0, "metrica": "usuario_adicionado", "valor": 1, "usuario": 2, "nome": "Isabela Oliveira"}
+{"ts": 1795396275.977, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "NEWUSER_3_Henrique Costa", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_NEWUSER_3"}
+{"ts": 1795396275.977, "componente": "cadastro", "id": 0, "metrica": "usuario_adicionado", "valor": 1, "usuario": 3, "nome": "Henrique Costa"}
+{"ts": 1795396275.991, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "NEWUSER_4_Lucas Pereira", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_NEWUSER_4"}
+{"ts": 1795396275.991, "componente": "cadastro", "id": 0, "metrica": "usuario_adicionado", "valor": 1, "usuario": 4, "nome": "Lucas Pereira"}
+{"ts": 1795396288.338, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "NEWUSER_5_Vitor Lima", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ERROR_NO_CAPACITY"}
+{"ts": 1795396300.498, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "KILL_0", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_KILL_0"}
+{"ts": 1795396300.499, "componente": "cadastro", "id": 0, "metrica": "servidor_removido", "valor": 1, "servidor": 0}

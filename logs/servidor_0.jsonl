@@ -1,0 +1,16 @@
+{"porta": 5001, "papel": "COORDENADOR", "ts": 1795396197.739, "componente": "coordenador", "id": 0, "metrica": "servidor_iniciado", "valor": 1}
+{"usuario": 12, "ts": 1795396252.677, "componente": "coordenador", "id": 0, "metrica": "newuser_recebido", "valor": 1}
+{"usuario": 12, "servidor": 0, "ts": 1795396252.678, "componente": "coordenador", "id": 0, "metrica": "newuser_adicionado", "valor": 1}
+{"usuario": 1, "ts": 1795396275.938, "componente": "coordenador", "id": 0, "metrica": "newuser_recebido", "valor": 1}
+{"usuario": 1, "servidor": 0, "ts": 1795396275.938, "componente": "coordenador", "id": 0, "metrica": "newuser_adicionado", "valor": 1}
+{"usuario": 2, "ts": 1795396275.962, "componente": "coordenador", "id": 0, "metrica": "newuser_recebido", "valor": 1}
+{"usuario": 2, "servidor": 0, "ts": 1795396275.962, "componente": "coordenador", "id": 0, "metrica": "newuser_adicionado", "valor": 1}
+{"usuario": 3, "ts": 1795396275.976, "componente": "coordenador", "id": 0, "metrica": "newuser_recebido", "valor": 1}
+{"usuario": 3, "servidor": 0, "ts": 1795396275.976, "componente": "coordenador", "id": 0, "metrica": "newuser_adicionado", "valor": 1}
+{"usuario": 4, "ts": 1795396275.99, "componente": "coordenador", "id": 0, "metrica": "newuser_recebido", "valor": 1}
+{"usuario": 4, "servidor": 0, "ts": 1795396275.99, "componente": "coordenador", "id": 0, "metrica": "newuser_adicionado", "valor": 1}
+{"usuario": 5, "ts": 1795396288.337, "componente": "coordenador", "id": 0, "metrica": "newuser_recebido", "valor": 1}
+{"usuario": 5, "motivo": "NO_CAPACITY", "ts": 1795396288.338, "componente": "coordenador", "id": 0, "metrica": "newuser_rejeitado", "valor": 1}
+{"alvo": 0, "ts": 1795396300.497, "componente": "coordenador", "id": 0, "metrica": "kill_recebido", "valor": 1}
+{"motivo": "KILL", "ts": 1795396300.498, "componente": "coordenador", "id": 0, "metrica": "servidor_encerrando", "valor": 1}
+{"ts": 1795396300.999, "componente": "coordenador", "id": 0, "metrica": "servidor_finalizado", "valor": 1}
