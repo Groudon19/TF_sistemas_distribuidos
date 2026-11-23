@@ -1,6 +1,8 @@
+import json
+import zlib
 import threading
 import time
-from sd.common.config import MAX_USERS_PER_SERVER
+from sd.common.config import MAX_USERS_PER_SERVER, SERVER_IP, SERVER_PORT
 
 
 class Estado:
@@ -14,6 +16,8 @@ class Estado:
         self.servers: dict[int, dict] = {}
         self.user_server: dict[int, int | None] = {}
         self.user_names: dict[int, str | None] = {}
+        self.processed: dict[tuple[int, int], int] = {}
+        self._coordinator_addr: tuple[str, int] = (SERVER_IP, SERVER_PORT)
 
     def register_server(self, server_id: int, ip: str | None = None, port: int | None = None) -> None:
         with self.lock:
@@ -226,3 +230,140 @@ class Estado:
                 "user_server": dict(self.user_server),
                 "user_names": dict(self.user_names),
             }
+            
+    @property
+    def coordinator_addr(self) -> tuple[str, int]:
+        with self.lock:
+            return self._coordinator_addr
+
+    @coordinator_addr.setter
+    def coordinator_addr(self, addr: tuple[str, int]) -> None:
+        with self.lock:
+            self._coordinator_addr = addr
+
+    def all_user_ids(self) -> list[int]:
+        with self.lock:
+            return sorted(self.user_server.keys())
+
+    def is_processed(self, key: tuple[int, int]) -> bool:
+        with self.lock:
+            return key in self.processed
+
+    def mark_processed(self, key: tuple[int, int], dest: int) -> bool:
+        """Registra atomicamente (sender, msg_id) -> dest. Retorna True só na 1ª inserção."""
+        with self.lock:
+            if key in self.processed:
+                return False
+            self.processed[key] = dest
+            return True
+
+    def apply_op(self, op: dict) -> bool:
+        """
+        Aplica de forma idempotente uma decisão replicada ao estado local.
+        Não verifica capacidade (a decisão já foi tomada pelo líder).
+        """
+        op_type = op.get("type")
+        data = op.get("data", {})
+
+        with self.lock:
+            if op_type == "SRV_UP":
+                sid = int(data["id"])
+                entry = self.servers.get(sid, {})
+                entry["alive"] = True
+                entry["starting"] = False
+                entry["reserved_at"] = None
+                if "ip" in data and data["ip"] is not None:
+                    entry["ip"] = data["ip"]
+                if "port" in data and data["port"] is not None:
+                    entry["port"] = int(data["port"])
+                self.servers[sid] = entry
+                return True
+
+            if op_type == "SRV_RESERVED":
+                sid = int(data["id"])
+                entry = self.servers.get(sid, {})
+                # Só define STARTING se o servidor ainda não avançou para ACTIVE ou DEAD
+                if not entry.get("alive") and "alive" not in entry:
+                    entry["alive"] = False
+                    entry["starting"] = True
+                    entry["reserved_at"] = None
+                if "ip" in data and data["ip"] is not None:
+                    entry["ip"] = data["ip"]
+                if "port" in data and data["port"] is not None:
+                    entry["port"] = int(data["port"])
+                self.servers[sid] = entry
+                return True
+
+            if op_type == "SRV_ACTIVE":
+                sid = int(data["id"])
+                entry = self.servers.get(sid, {})
+                entry["alive"] = True
+                entry["starting"] = False
+                entry["reserved_at"] = None
+                if "ip" in data and data["ip"] is not None:
+                    entry["ip"] = data["ip"]
+                if "port" in data and data["port"] is not None:
+                    entry["port"] = int(data["port"])
+                self.servers[sid] = entry
+                return True
+
+            if op_type == "SRV_DEAD":
+                sid = int(data["id"])
+                entry = self.servers.get(sid, {})
+                entry["alive"] = False
+                entry["starting"] = False
+                self.servers[sid] = entry
+                return True
+
+            if op_type == "USER_ADD":
+                uid = int(data["uid"])
+                sid = data["sid"]
+                self.user_server[uid] = int(sid) if sid is not None else None
+                self.user_names[uid] = data.get("nome")
+                return True
+
+            if op_type == "USER_MOVE":
+                uid = int(data["uid"])
+                sid = data["sid"]
+                self.user_server[uid] = int(sid) if sid is not None else None
+                return True
+
+            if op_type == "MSG_DONE":
+                sender = int(data["sender"])
+                msg_id = int(data["msg_id"])
+                dest = int(data["dest"])
+                self.processed[(sender, msg_id)] = dest
+                return True
+
+            return False
+
+    def digest(self) -> str:
+        """Retorna o CRC32 hexadecimal de 8 dígitos do estado replicado canônico."""
+        with self.lock:
+            canonical_servers = {
+                str(sid): {k: v for k, v in sorted(info.items()) if k != "reserved_at"}
+                for sid, info in sorted(self.servers.items())
+            }
+            canonical_user_server = {
+                str(uid): sid for uid, sid in sorted(self.user_server.items())
+            }
+            canonical_user_names = {
+                str(uid): name for uid, name in sorted(self.user_names.items())
+            }
+            canonical_processed = {
+                f"{sender}:{msg_id}": dest
+                for (sender, msg_id), dest in sorted(self.processed.items())
+            }
+            payload = json.dumps(
+                {
+                    "servers": canonical_servers,
+                    "user_server": canonical_user_server,
+                    "user_names": canonical_user_names,
+                    "processed": canonical_processed,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+            crc = zlib.crc32(payload) & 0xFFFFFFFF
+            return f"{crc:08x}"

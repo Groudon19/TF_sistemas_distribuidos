@@ -1,5 +1,6 @@
 import threading
 import time
+from typing import Callable
 
 from sd.common import config
 from sd.common.logger import MetricsLogger
@@ -21,7 +22,7 @@ from sd.placement import balance_metrics, pick_server_for_new_user, reassign_orp
 
 
 class Coordenador:
-    """Processa comandos de protocolo de forma serializada e coordena o escalonamento."""
+    """Processa comandos de protocolo de forma serializada e coordena escalonamento e replicação."""
 
     def __init__(self, state: Estado, logger: MetricsLogger, wait_sec: float = config.NEWUSER_WAIT_SEC):
         self.state = state
@@ -31,15 +32,43 @@ class Coordenador:
         self._cond = threading.Condition(self._op_lock)
         self._waiting = 0
         self.escalador = None
-        self._handlers = {
+        self.replicador = None
+        self._handlers: dict[str, Callable[[str], tuple[str, bool]]] = {
             "NEWUSER": self.handle_newuser,
             "KILL": self.handle_kill,
             "HELLO": self.handle_hello,
             "SHUTDOWN": self.handle_shutdown,
         }
 
+    def register_handler(self, prefix: str, fn: Callable[[str], tuple[str, bool]]) -> None:
+        self._handlers[prefix] = fn
+
     def attach_scaler(self, escalador) -> None:
         self.escalador = escalador
+
+    def attach_replicator(self, replicador) -> None:
+        self.replicador = replicador
+
+    def _emit(self, op_type: str, **data) -> int:
+        """Deve ser chamado sob _op_lock."""
+        if self.replicador is None:
+            return 0
+        return self.replicador.append_locked(op_type, data)
+
+    def _replicate(self, seq: int, budget: float = config.REPL_WAIT_SEC) -> None:
+        """Deve ser chamado fora de qualquer lock."""
+        if self.replicador is None or seq <= 0:
+            return
+        timeout = max(0.2, min(budget, config.REPL_WAIT_SEC))
+        info = self.replicador.wait_replicated(seq, timeout=timeout)
+        if info["synced"] > 0 or info["lagging"] > 0:
+            self.logger.log(
+                "replicacao_espera",
+                valor=info["elapsed"],
+                seq=seq,
+                sincronizados=info["synced"],
+                atrasados=info["lagging"],
+            )
 
     def _balance_snapshot(self) -> dict:
         loads = self.state.loads()
@@ -62,15 +91,16 @@ class Coordenador:
             self.logger.log("razao_servidores_ativos", valor=snap["razao_servidores"], evento=evento)
         self.logger.log("usuarios_sem_servidor", valor=snap["sem_servidor"], evento=evento)
 
-    def _place_pending_locked(self) -> int:
+    def _place_pending_locked(self) -> dict[int, int]:
+        """Deve ser chamado sob _op_lock. Retorna {uid: sid} efetivamente aplicados."""
         orphans = self.state.unassigned_users()
         if not orphans:
-            return 0
+            return {}
         assignments, _ = reassign_orphans(orphans, self.state.loads(), self.state.capacity)
         if not assignments:
-            return 0
-        rejected = self.state.apply_assignments(assignments)
-        return len(assignments) - len(rejected)
+            return {}
+        rejected = set(self.state.apply_assignments(assignments))
+        return {uid: sid for uid, sid in assignments.items() if uid not in rejected}
 
     def handle_line(self, line: str) -> tuple[str, bool]:
         try:
@@ -101,6 +131,7 @@ class Coordenador:
         total_u = 0
         active_srvs = 0
         result = "FULL"
+        op_seq = 0
 
         with self._cond:
             try:
@@ -113,6 +144,7 @@ class Coordenador:
                     if target is not None:
                         result = self.state.add_user(user_id, nome, target)
                         if result == "ADDED":
+                            op_seq = self._emit("USER_ADD", uid=user_id, nome=nome, sid=target)
                             snap = self._balance_snapshot()
                         break
 
@@ -146,6 +178,8 @@ class Coordenador:
         if result == "ADDED":
             if self.escalador is not None:
                 self.escalador.notify()
+            remaining_budget = max(0.2, (self.wait_sec + config.REPL_WAIT_SEC) - waited)
+            self._replicate(op_seq, budget=remaining_budget)
             self.logger.log("newuser_adicionado", valor=1, usuario=user_id, servidor=target)
             assert snap is not None
             self._emit_balance("newuser", snap)
@@ -178,15 +212,18 @@ class Coordenador:
         if not self.state.is_known_server(server_id):
             return fmt_error("UNKNOWN_SERVER"), False
 
-        # Caso especial: servidor ainda estava STARTING
         with self._op_lock:
             was_starting = self.state.abort_starting(server_id)
+            cancel_seq = self._emit("SRV_DEAD", id=server_id) if was_starting else 0
+
         if was_starting:
+            self._replicate(cancel_seq)
             if self.escalador is not None:
                 self.escalador.terminate_process(server_id)
             self.logger.log("servidor_cancelado", valor=1, servidor=server_id)
             return fmt_ack_kill(server_id), False
 
+        last_seq = 0
         with self._op_lock:
             t0 = time.monotonic()
             orphans = self.state.fail_server(server_id)
@@ -198,20 +235,28 @@ class Coordenador:
                 snap = None
             else:
                 already_dead = False
+                last_seq = self._emit("SRV_DEAD", id=server_id)
                 assignments, pending = reassign_orphans(orphans, self.state.loads(), self.state.capacity)
-                rejected = self.state.apply_assignments(assignments)
-                if rejected:
-                    pending = sorted(set(pending) | set(rejected))
-                    migrated_count = len(assignments) - len(rejected)
-                else:
-                    migrated_count = len(assignments)
-                pending_count = len(pending)
+                rejected = set(self.state.apply_assignments(assignments))
+                applied_map = {uid: sid for uid, sid in assignments.items() if uid not in rejected}
+                pending_set = set(pending) | rejected
+
+                for uid in sorted(orphans):
+                    final_sid = applied_map.get(uid)  # None se ficou pendente
+                    last_seq = self._emit("USER_MOVE", uid=uid, sid=final_sid)
+
+                migrated_count = len(applied_map)
+                pending_count = len(pending_set)
                 duration = round(time.monotonic() - t0, 6)
                 snap = self._balance_snapshot()
 
         if already_dead:
             self.logger.log("kill_duplicado", valor=1, alvo=server_id)
             return fmt_ack_kill(server_id), False
+
+        if self.replicador is not None:
+            self.replicador.remove_follower(server_id)
+        self._replicate(last_seq)
 
         self.logger.log("servidor_desativado", valor=1, servidor=server_id, motivo="kill")
         self.logger.log("usuarios_migrados", valor=migrated_count, evento="kill", servidor=server_id)
@@ -232,21 +277,30 @@ class Coordenador:
             return fmt_error("NOT_COORDINATOR"), False
 
         now = time.monotonic()
+        last_seq = 0
+        addr: tuple[str, int] | None = None
+
         with self._cond:
             reserved_ts = self.state.reserved_at(server_id)
             status = self.state.mark_active(server_id)
-            placed = 0
+            placed_map: dict[int, int] = {}
             snap: dict | None = None
             if status == "ACTIVATED":
-                placed = self._place_pending_locked()
+                addr = self.state.address_of(server_id)
+                last_seq = self._emit("SRV_ACTIVE", id=server_id)
+                placed_map = self._place_pending_locked()
+                for uid, sid in sorted(placed_map.items()):
+                    last_seq = self._emit("USER_MOVE", uid=uid, sid=sid)
                 snap = self._balance_snapshot()
                 self._cond.notify_all()
 
         if status == "ACTIVATED":
+            if self.replicador is not None and addr is not None:
+                self.replicador.add_follower(server_id, addr[0], addr[1])
             elapsed = round(now - reserved_ts, 4) if reserved_ts is not None else 0.0
             self.logger.log("tempo_novo_servidor", valor=elapsed, servidor=server_id)
             self.logger.log("usuarios_migrados", valor=0, evento="criacao", servidor=server_id)
-            self.logger.log("usuarios_recolocados", valor=placed, servidor=server_id)
+            self.logger.log("usuarios_recolocados", valor=len(placed_map), servidor=server_id)
             assert snap is not None
             self._emit_balance("criacao", snap)
             if self.escalador is not None:
@@ -287,23 +341,37 @@ class Coordenador:
             for _ in range(n):
                 try:
                     sid = self.state.reserve_server(config.SERVER_IP, config.port_for_server)
+                    port = config.port_for_server(sid)
+                    self._emit("SRV_RESERVED", id=sid, ip=config.SERVER_IP, port=port)
                     reserved.append(sid)
                 except ValueError:
                     break
         return reserved
 
     def abort_starting(self, server_id: int, motivo: str) -> bool:
+        seq = 0
         with self._op_lock:
             aborted = self.state.abort_starting(server_id)
+            if aborted:
+                seq = self._emit("SRV_DEAD", id=server_id)
         if aborted:
+            self._replicate(seq)
             self.logger.log("servidor_abortado", valor=1, servidor=server_id, motivo=motivo)
         return aborted
 
     def retire_idle(self, server_id: int, idle_for: float) -> bool:
+        seq = 0
         with self._op_lock:
             retired = self.state.retire_if_idle(server_id)
-            snap = self._balance_snapshot() if retired else None
+            if retired:
+                seq = self._emit("SRV_DEAD", id=server_id)
+                snap = self._balance_snapshot()
+            else:
+                snap = None
         if retired:
+            if self.replicador is not None:
+                self.replicador.remove_follower(server_id)
+            self._replicate(seq)
             self.logger.log("servidor_desativado", valor=1, servidor=server_id, motivo="ocioso")
             self.logger.log("tempo_desativacao_ocioso", valor=round(idle_for, 4), servidor=server_id)
             assert snap is not None

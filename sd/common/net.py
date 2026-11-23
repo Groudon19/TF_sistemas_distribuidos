@@ -35,3 +35,36 @@ def send_and_recv(host: str, port: int, line: str, timeout: float = NET_TIMEOUT_
         sock.settimeout(timeout)
         send_line(sock, line)
         return recv_line(sock)
+    
+class LineReader:
+    """Leitor de linhas TCP com buffer interno para evitar recv(1) por byte."""
+
+    def __init__(self, sock: socket.socket, max_bytes: int = MAX_LINE_BYTES, chunk_size: int = 4096):
+        self.sock = sock
+        self.max_bytes = max_bytes
+        self.chunk_size = chunk_size
+        self._buf = bytearray()
+
+    def read_line(self, timeout: float | None = None) -> str | None:
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+
+        while True:
+            nl_idx = self._buf.find(b"\n")
+            if nl_idx != -1:
+                raw = bytes(self._buf[: nl_idx + 1])
+                del self._buf[: nl_idx + 1]
+                return raw.decode("utf-8", errors="replace").rstrip("\r\n")
+
+            if len(self._buf) > self.max_bytes:
+                raise ValueError(f"Linha excedeu o limite de {self.max_bytes} bytes")
+
+            chunk = self.sock.recv(self.chunk_size)
+            if not chunk:
+                if not self._buf:
+                    return None
+                raw = bytes(self._buf)
+                self._buf.clear()
+                return raw.decode("utf-8", errors="replace").rstrip("\r\n")
+
+            self._buf.extend(chunk)

@@ -9,11 +9,14 @@ import time
 from sd import cadastro_client, spawner
 from sd.common import config
 from sd.common.logger import MetricsLogger
-from sd.common.net import recv_line, send_and_recv, send_line
-from sd.common.protocolo import fmt_error, fmt_hello, fmt_shutdown
+from sd.common.net import LineReader, send_and_recv, send_line
+from sd.common.protocolo import fmt_digest, fmt_error, fmt_hello, fmt_shutdown
 from sd.coordenador import Coordenador
 from sd.escalador import Escalador
 from sd.estado import Estado
+from sd.mensagens import Receptor, Roteador
+from sd.replicacao import Aplicador, OpLog, Replicador
+from sd.usuarios import GerenciadorUsuarios
 
 IDLE_CONN_TIMEOUT_SEC = 30.0
 
@@ -41,11 +44,11 @@ class ClientConnectionHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         srv: NodeTCPServer = self.server  # type: ignore[assignment]
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
-        self.request.settimeout(IDLE_CONN_TIMEOUT_SEC)
+        reader = LineReader(self.request)
 
         while not srv.shutdown_event.is_set():
             try:
-                line = recv_line(self.request)
+                line = reader.read_line(timeout=IDLE_CONN_TIMEOUT_SEC)
             except ValueError:
                 srv.logger.log("erro_rede", valor=1, origem=peer, motivo="LINE_TOO_LONG")
                 try:
@@ -63,7 +66,11 @@ class ClientConnectionHandler(socketserver.BaseRequestHandler):
             if not line.strip():
                 continue
 
-            reply, should_shutdown = srv.coordinator.handle_line(line)
+            try:
+                reply, should_shutdown = srv.coordinator.handle_line(line)
+            except ConnectionResetError:
+                # Usado por CHAOS_DROP_ACK_PROB para simular queda de ACK após processamento
+                break
 
             try:
                 send_line(self.request, reply)
@@ -142,13 +149,32 @@ def main() -> None:
 
     logger = MetricsLogger("coordenador" if is_coord else "servidor", node_id)
     state = Estado(my_id=node_id, is_coordinator=is_coord)
-    state.register_server(node_id, ip=config.SERVER_IP, port=port)
+    state.coordinator_addr = (args.coord_ip, args.coord_port)
 
     coordinator = Coordenador(state=state, logger=logger)
     shutdown_event = threading.Event()
+
+    oplog = OpLog(node_id=node_id)
     escalador: Escalador | None = None
+    replicador: Replicador | None = None
+    aplicador: Aplicador | None = None
+
+    receptor = Receptor(state=state, logger=logger)
+    coordinator.register_handler("DELIVER", receptor.handle_deliver)
 
     if is_coord:
+        state.register_server(node_id, ip=config.SERVER_IP, port=port)
+        replicador = Replicador(oplog=oplog, logger=logger)
+        coordinator.attach_replicator(replicador)
+        replicador.append_locked("SRV_UP", {"id": node_id, "ip": config.SERVER_IP, "port": port})
+
+        roteador = Roteador(coordenador=coordinator, logger=logger)
+        coordinator.register_handler("MSG", roteador.handle_msg)
+        coordinator.register_handler(
+            "DIGEST",
+            lambda _line: (fmt_digest(oplog.head(), state.digest()), False),
+        )
+
         escalador = Escalador(
             coordenador=coordinator,
             logger=logger,
@@ -158,6 +184,15 @@ def main() -> None:
             terminate_fn=spawner.terminate_process,
         )
         coordinator.attach_scaler(escalador)
+        wake_evt = threading.Event()
+    else:
+        # Seguidor não se auto-registra; recebe o estado via REPL
+        aplicador = Aplicador(state=state, oplog=oplog, logger=logger)
+        coordinator.register_handler("REPL", aplicador.handle_repl)
+        coordinator.register_handler("DIGEST", aplicador.handle_digest)
+        wake_evt = aplicador.on_applied_event
+
+    gerenciador_usuarios = GerenciadorUsuarios(state=state, logger=logger, wake_event=wake_evt)
 
     def _signal_handler(signum, _frame):
         logger.log("sinal_recebido", valor=signum)
@@ -187,6 +222,7 @@ def main() -> None:
     print(f"[ok] Servidor {node_id} ({role}) escutando em {config.BIND_IP}:{port}")
     logger.log("servidor_iniciado", valor=1, porta=port, papel=role)
 
+    gerenciador_usuarios.start()
     if escalador is not None:
         escalador.start()
     else:
@@ -200,10 +236,17 @@ def main() -> None:
         while not shutdown_event.is_set():
             shutdown_event.wait(timeout=0.5)
     finally:
+        # Ordem obrigatória de drenagem antes de fechar o socket TCP
+        gerenciador_usuarios.stop(drain=True, timeout=config.DRAIN_TIMEOUT_SEC)
+        receptor.wait_idle(timeout=config.DRAIN_TIMEOUT_SEC)
         if escalador is not None:
             escalador.stop()
+        if replicador is not None:
+            replicador.stop()
         tcp_server.shutdown()
         tcp_server.server_close()
+        receptor.close()
+        oplog.close()
         logger.log("servidor_finalizado", valor=1)
         print(f"[ok] Servidor {node_id} encerrado.")
 

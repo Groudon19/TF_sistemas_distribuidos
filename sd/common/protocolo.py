@@ -255,8 +255,6 @@ def fmt_msg(msg_id: int, sender: int, dest: int, content: str) -> str:
     return f"MSG_{msg_id}_{sender}_{dest}_{escaped}"
     
 
-
-
 def fmt_deliver(msg_id: int, sender: int, dest: int, content: str) -> str:
     escaped = escape_content(content)
     return f"MSG_{msg_id}_{sender}_{dest}_{escaped}".replace("MSG_", "DELIVER_", 1)
