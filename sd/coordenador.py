@@ -16,14 +16,14 @@ from sd.common.protocolo import (
     parse_newuser,
     parse_shutdown,
 )
-from sd.estado import ServerState
+from sd.estado import Estado
 from sd.placement import balance_metrics, pick_server_for_new_user, reassign_orphans, servers_needed
 
 
-class Coordinator:
+class Coordenador:
     """Processa comandos de protocolo de forma serializada e coordena o escalonamento."""
 
-    def __init__(self, state: ServerState, logger: MetricsLogger, wait_sec: float = config.NEWUSER_WAIT_SEC):
+    def __init__(self, state: Estado, logger: MetricsLogger, wait_sec: float = config.NEWUSER_WAIT_SEC):
         self.state = state
         self.logger = logger
         self.wait_sec = wait_sec

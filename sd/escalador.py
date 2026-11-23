@@ -5,7 +5,7 @@ from typing import Callable
 
 from sd.common import config
 from sd.common.logger import MetricsLogger
-from sd.coordenador import Coordinator
+from sd.coordenador import Coordenador
 from sd.placement import desired_servers, pick_server_to_retire, servers_to_spawn
 
 
@@ -14,7 +14,7 @@ class Escalador:
 
     def __init__(
         self,
-        coordenador: Coordinator,
+        coordenador: Coordenador,
         logger: MetricsLogger,
         spawn_fn: Callable[[int, str, int], subprocess.Popen],
         newid_fn: Callable[[int, MetricsLogger], bool],
@@ -35,6 +35,7 @@ class Escalador:
         self._idle_since: dict[int, float] = {}
         self._consecutive_failures = 0
         self._pause_until = 0.0
+        self._at_limit = False
 
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -97,15 +98,17 @@ class Escalador:
                 self.logger.log("erro_escalador", valor=1, erro=str(exc))
 
     def _record_spawn_failure(self, now: float) -> None:
+        paused_now = False
+        failures = 0
         with self._lock:
             self._consecutive_failures += 1
-            if self._consecutive_failures >= config.SPAWN_FAIL_LIMIT:
+            failures = self._consecutive_failures
+            if failures >= config.SPAWN_FAIL_LIMIT:
                 self._pause_until = now + config.SPAWN_BACKOFF_SEC
-                self.logger.log(
-                    "spawn_pausado",
-                    valor=config.SPAWN_BACKOFF_SEC,
-                    falhas=self._consecutive_failures,
-                )
+                paused_now = True
+
+        if paused_now:
+            self.logger.log("spawn_pausado", valor=config.SPAWN_BACKOFF_SEC, falhas=failures)
 
     def evaluate(self) -> None:
         now = self.now_fn()
@@ -119,6 +122,14 @@ class Escalador:
                 dead_pids.add(sid)
 
         view = self.coordenador.scaling_view()
+        starting_set = set(view["starting"])
+
+        # Limpa entradas de processos já encerrados que não estão mais em STARTING
+        orphan_dead = dead_pids - starting_set
+        if orphan_dead:
+            with self._lock:
+                for sid in orphan_dead:
+                    self._procs.pop(sid, None)
 
         # 2. Vigia servidores em STARTING (morte prematura ou timeout)
         for sid in view["starting"]:
@@ -148,6 +159,7 @@ class Escalador:
         if not paused:
             n = servers_to_spawn(desejado, atual, config.MAX_SERVERS)
             if n > 0:
+                self._at_limit = False
                 if view["pending"] > 0:
                     motivo = "pendentes"
                 elif view["waiting"] > 0:
@@ -171,7 +183,11 @@ class Escalador:
                         self.logger.log("spawn_falhou", valor=1, servidor=sid, erro=str(exc))
                         self._record_spawn_failure(now)
             elif desejado > config.MAX_SERVERS and atual >= config.MAX_SERVERS:
-                self.logger.log("limite_servidores", valor=config.MAX_SERVERS)
+                if not self._at_limit:
+                    self._at_limit = True
+                    self.logger.log("limite_servidores", valor=config.MAX_SERVERS)
+            else:
+                self._at_limit = False
 
         # 4. Desativação de servidores ociosos
         current_idle = set(view["idle"])
