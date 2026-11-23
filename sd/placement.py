@@ -65,3 +65,27 @@ def servers_needed(total_users: int, capacity: int) -> int:
     if total_users <= 0 or capacity <= 0:
         return 0
     return -(-total_users // capacity)
+
+
+def desired_servers(total_users: int, waiting: int, capacity: int) -> int:
+    """
+    Calcula a quantidade desejada de servidores (incluindo margem proativa
+    quando um servidor atinge a capacidade múltipla).
+    """
+    if capacity <= 0:
+        return 1
+    return max(1, (total_users + waiting) // capacity + 1)
+
+
+def servers_to_spawn(desired: int, current: int, max_servers: int) -> int:
+    """Calcula quantos novos servidores criar respeitando o teto max_servers."""
+    return max(0, min(desired, max_servers) - current)
+
+
+def pick_server_to_retire(idle_since: dict[int, float], now: float, grace: float) -> int | None:
+    """
+    Entre os servidores ociosos há pelo menos `grace` segundos,
+    escolhe o de maior ID (ou None se nenhum atingiu a carência).
+    """
+    eligible = [sid for sid, since in idle_since.items() if (now - since) >= grace]
+    return max(eligible) if eligible else None

@@ -12,3 +12,4 @@
 {"ts": 1795397935.54, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "NEWUSER_6_Isabela Oliveira", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_NEWUSER_6"}
 {"ts": 1795397935.541, "componente": "cadastro", "id": 0, "metrica": "usuario_adicionado", "valor": 1, "usuario": 6, "nome": "Isabela Oliveira"}
 {"ts": 1795397955.609, "componente": "cadastro", "id": 0, "metrica": "enviado", "valor": 1, "mensagem": "KILL_1", "destino": "127.0.0.1:5001", "tentativa": 1, "resposta": "ACK_KILL_1"}
+{"ts": 1795398037.555, "componente": "cadastro", "id": 0, "metrica": "fim", "valor": 1}

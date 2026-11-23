@@ -3,6 +3,9 @@ from sd.placement import (
     pick_server_for_new_user,
     reassign_orphans,
     servers_needed,
+    desired_servers, 
+    pick_server_to_retire, 
+    servers_to_spawn
 )
 
 
@@ -71,3 +74,23 @@ def test_servers_needed():
     assert servers_needed(6, 5) == 2
     assert servers_needed(10, 5) == 2
     assert servers_needed(11, 5) == 3
+    
+
+def test_desired_servers_e_servers_to_spawn():
+    assert desired_servers(0, 0, 5) == 1
+    assert desired_servers(4, 0, 5) == 1
+    assert desired_servers(5, 0, 5) == 2
+    assert desired_servers(9, 0, 5) == 2
+    assert desired_servers(10, 0, 5) == 3
+    assert desired_servers(9, 1, 5) == 3
+
+    assert servers_to_spawn(desired=4, current=2, max_servers=10) == 2
+    assert servers_to_spawn(desired=5, current=3, max_servers=3) == 0
+    assert servers_to_spawn(desired=1, current=3, max_servers=10) == 0
+
+
+def test_pick_server_to_retire():
+    idle = {1: 10.0, 3: 11.0, 2: 14.0}
+    assert pick_server_to_retire(idle, now=12.5, grace=3.0) is None
+    # Em now=14.5: servidores 1 (4.5s) e 3 (3.5s) passaram da carência -> escolhe maior ID (3)
+    assert pick_server_to_retire(idle, now=14.5, grace=3.0) == 3

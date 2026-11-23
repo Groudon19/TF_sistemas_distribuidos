@@ -9,10 +9,16 @@ from sd.common.protocolo import (
     fmt_msg,
     fmt_newcoordinatorip,
     fmt_newid,
+    fmt_hello,
+    fmt_ack_hello,
+    fmt_shutdown,
+    fmt_ack_shutdown,
     parse_command,
     parse_kill,
     parse_msg,
     parse_newuser,
+    parse_hello,
+    parse_shutdown,
     unescape_content,
 )
 
@@ -130,3 +136,21 @@ class TestFormatters:
         assert fmt_ack_kill(0) == "ACK_KILL_0"
         assert fmt_newid(1) == "NEWID_1"
         assert fmt_newcoordinatorip("127.0.0.1", 5001) == "NEWCOORDINATORIP_127.0.0.1_5001"
+        
+class TestHelloAndShutdown:
+    def test_round_trip(self):
+        assert parse_hello(fmt_hello(0)) == 0
+        assert parse_hello(fmt_hello(12)) == 12
+        assert fmt_ack_hello(3) == "ACK_HELLO_3"
+
+        assert parse_shutdown(fmt_shutdown(0)) == 0
+        assert parse_shutdown(fmt_shutdown(7)) == 7
+        assert fmt_ack_shutdown(7) == "ACK_SHUTDOWN_7"
+
+    def test_invalidos(self):
+        for fn in (parse_hello, parse_shutdown):
+            prefix = "HELLO" if fn is parse_hello else "SHUTDOWN"
+            for bad in [f"{prefix}_", f"{prefix}_x", f"{prefix}_1234567890123456789", f"{prefix}_١"]:
+                with pytest.raises(ProtocolError) as exc:
+                    fn(bad)
+                assert exc.value.code == "INVALID_FORMAT"

@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from sd.estado import Estado
-
+from sd.common.config import port_for_server
 
 def test_fail_server_e_idempotencia():
     st = Estado(my_id=0, is_coordinator=True, capacity=5)
@@ -64,3 +64,50 @@ def test_concorrencia_add_user_nao_estoura_capacidade():
     assert results.count("ADDED") == 5
     assert results.count("FULL") == 45
     assert st.load_of(0) == 5
+    
+
+
+
+
+def test_reserve_server_crescente_e_concorrente():
+    st = Estado(my_id=0)
+    st.register_server(0, "127.0.0.1", 5001)
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        ids = list(pool.map(lambda _: st.reserve_server("127.0.0.1", port_for_server), range(20)))
+
+    assert len(set(ids)) == 20
+    assert sorted(ids) == list(range(1, 21))
+
+    # Mesmo matando um servidor no meio, o próximo ID continua crescente
+    st.mark_active(5)
+    st.fail_server(5)
+    assert st.reserve_server("127.0.0.1", port_for_server) == 21
+
+
+def test_mark_active_e_add_user_em_starting():
+    st = Estado(my_id=0)
+    st.register_server(0, "127.0.0.1", 5001)
+    sid = st.reserve_server("127.0.0.1", port_for_server)
+
+    assert st.add_user(1, "Ana", sid) == "NO_SERVER"
+    assert st.mark_active(sid) == "ACTIVATED"
+    assert st.mark_active(sid) == "ALREADY_ACTIVE"
+    assert st.mark_active(99) == "UNKNOWN"
+
+    st.fail_server(sid)
+    assert st.mark_active(sid) == "DEAD"
+
+
+def test_retire_if_idle():
+    st = Estado(my_id=0)
+    st.register_server(0, "127.0.0.1", 5001)
+    st.register_server(1, "127.0.0.1", 5002)
+    st.register_server(2, "127.0.0.1", 5003)
+
+    st.add_user(10, "Ana", 1)
+
+    assert st.retire_if_idle(0) is False  # não desativa my_id
+    assert st.retire_if_idle(1) is False  # tem usuário
+    assert st.retire_if_idle(2) is True   # ativo e ocioso
+    assert not st.is_alive(2)

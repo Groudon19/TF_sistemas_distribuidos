@@ -43,3 +43,5 @@
 {"evento": "kill", "ts": 1795397955.608, "componente": "coordenador", "id": 0, "metrica": "desvio_padrao_usuarios", "valor": 0.0}
 {"evento": "kill", "ts": 1795397955.609, "componente": "coordenador", "id": 0, "metrica": "razao_servidores_ativos", "valor": 1.0}
 {"evento": "kill", "ts": 1795397955.609, "componente": "coordenador", "id": 0, "metrica": "usuarios_sem_servidor", "valor": 0}
+{"ts": 1795398039.312, "componente": "coordenador", "id": 0, "metrica": "sinal_recebido", "valor": 2}
+{"ts": 1795398039.381, "componente": "coordenador", "id": 0, "metrica": "servidor_finalizado", "valor": 1}

@@ -113,6 +113,13 @@ def parse_msg(line: str) -> tuple[int, int, int, str]:
     return msg_id, sender, dest, content
 
 
+def _parse_cmd_id(prefix: str, line: str) -> int:
+    cleaned = line.strip()
+    match = re.fullmatch(rf"{re.escape(prefix)}_(\d{{1,18}})", cleaned, re.ASCII)
+    if not match:
+        raise ProtocolError("INVALID_FORMAT", f"Formato inválido para {prefix}: {line!r}")
+    return int(match.group(1))
+
 # =====================================================================
 # Funções de Formatação (fmt_*)
 # =====================================================================
@@ -145,3 +152,30 @@ def fmt_newcoordinatorip(ip: str, port: int) -> str:
 def fmt_msg(msg_id: int, sender: int, dest: int, content: str) -> str:
     escaped = escape_content(content)
     return f"MSG_{msg_id}_{sender}_{dest}_{escaped}"
+
+def parse_kill(line: str) -> int:
+    return _parse_cmd_id("KILL", line)
+
+
+def parse_hello(line: str) -> int:
+    return _parse_cmd_id("HELLO", line)
+
+
+def parse_shutdown(line: str) -> int:
+    return _parse_cmd_id("SHUTDOWN", line)
+
+
+# Adicione nos formatadores (fmt_*):
+def fmt_hello(server_id: int) -> str:
+    return f"HELLO_{server_id}"
+
+
+def fmt_ack_hello(server_id: int) -> str:
+    return f"ACK_HELLO_{server_id}"
+
+
+def fmt_shutdown(server_id: int) -> str:
+    return f"SHUTDOWN_{server_id}"
+
+def fmt_ack_shutdown(server_id: int) -> str:
+    return f"ACK_SHUTDOWN_{server_id}"

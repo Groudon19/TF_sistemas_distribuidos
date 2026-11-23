@@ -86,3 +86,21 @@ def port_for_server(server_id: int) -> int:
     if port > 65535:
         raise ValueError(f"Porta calculada fora do limite: {port}")
     return port
+
+
+# Adicione ao final de sd/common/config.py:
+_RAW_MAX_SERVERS = cfg_int("MAX_SERVERS", 20, 1)
+MAX_SERVERS = min(_RAW_MAX_SERVERS, 65535 - SERVER_PORT + 1)
+
+_CADASTRO_SEND_TIMEOUT = cfg_float("SEND_TIMEOUT", 3.0, 0.1)
+_RAW_NEWUSER_WAIT = cfg_float("NEWUSER_WAIT_SEC", 2.0, 0.0)
+NEWUSER_WAIT_SEC = max(0.0, min(_RAW_NEWUSER_WAIT, _CADASTRO_SEND_TIMEOUT - 1.0))
+
+SPAWN_TIMEOUT_SEC = cfg_float("SPAWN_TIMEOUT_SEC", 10.0, 0.5)
+SPAWN_FAIL_LIMIT = cfg_int("SPAWN_FAIL_LIMIT", 3, 1)
+SPAWN_BACKOFF_SEC = cfg_float("SPAWN_BACKOFF_SEC", 5.0, 0.1)
+IDLE_GRACE_SEC = cfg_float("IDLE_GRACE_SEC", 3.0, 0.0)
+SCALER_INTERVAL_SEC = cfg_float("SCALER_INTERVAL_SEC", 0.5, 0.05)
+INTERNAL_TIMEOUT_SEC = cfg_float("INTERNAL_TIMEOUT_SEC", 1.0, 0.1)
+HELLO_RETRIES = cfg_int("HELLO_RETRIES", 20, 1)
+HELLO_RETRY_DELAY = cfg_float("HELLO_RETRY_DELAY", 0.25, 0.01)
