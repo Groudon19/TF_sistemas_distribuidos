@@ -10,7 +10,7 @@ from sd.common.logger import MetricsLogger
 from sd.common.net import recv_line, send_line
 from sd.common.protocolo import fmt_error
 from sd.coordenador import Coordenador
-from sd.estado import Estado 
+from sd.estado import Estado
 
 IDLE_CONN_TIMEOUT_SEC = 30.0
 
@@ -18,6 +18,7 @@ IDLE_CONN_TIMEOUT_SEC = 30.0
 class NodeTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 128
 
     def __init__(
         self,
@@ -83,9 +84,17 @@ class ClientConnectionHandler(socketserver.BaseRequestHandler):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Servidor do Sistema Distribuído")
     parser.add_argument("--id", type=int, required=True, help="Identificador inteiro >= 0 do servidor")
+    parser.add_argument(
+        "--virtual-servers",
+        type=int,
+        default=0,
+        help="Quantidade de servidores simulados (apenas para teste da fase 3)",
+    )
     args = parser.parse_args()
     if args.id < 0:
         parser.error("--id deve ser >= 0")
+    if args.virtual_servers < 0:
+        parser.error("--virtual-servers deve ser >= 0")
     return args
 
 
@@ -99,6 +108,12 @@ def main() -> None:
     state = Estado(my_id=node_id, is_coordinator=is_coord)
     state.register_server(node_id, ip=config.SERVER_IP, port=port)
 
+    if args.virtual_servers > 0:
+        print(f"[aviso] Registrando {args.virtual_servers} servidor(es) virtual(is) para teste da fase 3.")
+        for i in range(args.virtual_servers + 1):
+            if i != node_id:
+                state.register_server(i, ip=config.SERVER_IP, port=config.port_for_server(i))
+
     coordinator = Coordenador(state=state, logger=logger)
     shutdown_event = threading.Event()
 
@@ -111,20 +126,23 @@ def main() -> None:
 
     try:
         tcp_server = NodeTCPServer(
-            (config.SERVER_IP, port),
+            (config.BIND_IP, port),
             ClientConnectionHandler,
             coordinator=coordinator,
             logger=logger,
             shutdown_event=shutdown_event,
         )
     except OSError as exc:
-        sys.exit(f"Erro ao abrir socket em {config.SERVER_IP}:{port}: {exc}")
+        sys.exit(f"Erro ao abrir socket em {config.BIND_IP}:{port}: {exc}")
 
-    server_thread = threading.Thread(target=tcp_server.serve_forever, daemon=True)
+    server_thread = threading.Thread(
+        target=lambda: tcp_server.serve_forever(poll_interval=0.1),
+        daemon=True,
+    )
     server_thread.start()
 
     role = "COORDENADOR" if is_coord else "SERVIDOR"
-    print(f"[ok] Servidor {node_id} ({role}) escutando em {config.SERVER_IP}:{port}")
+    print(f"[ok] Servidor {node_id} ({role}) escutando em {config.BIND_IP}:{port} (anunciado: {config.SERVER_IP}:{port})")
     logger.log("servidor_iniciado", valor=1, porta=port, papel=role)
 
     try:

@@ -11,7 +11,7 @@ class Estado:
         self.is_coordinator = is_coordinator
         self.capacity = capacity
         self.servers: dict[int, dict] = {}
-        self.user_server: dict[int, int] = {}
+        self.user_server: dict[int, int | None] = {}
         self.user_names: dict[int, str | None] = {}
 
     def register_server(self, server_id: int, ip: str | None = None, port: int | None = None) -> None:
@@ -23,6 +23,19 @@ class Estado:
             if port is not None:
                 entry["port"] = port
             self.servers[server_id] = entry
+
+    def alive_server_ids(self) -> list[int]:
+        with self.lock:
+            return sorted(sid for sid, info in self.servers.items() if info.get("alive"))
+
+    def is_known_server(self, server_id: int) -> bool:
+        with self.lock:
+            return server_id in self.servers
+
+    def is_alive(self, server_id: int) -> bool:
+        with self.lock:
+            info = self.servers.get(server_id)
+            return bool(info and info.get("alive"))
 
     def has_user(self, user_id: int) -> bool:
         with self.lock:
@@ -45,7 +58,7 @@ class Estado:
         with self.lock:
             active_loads = {sid: 0 for sid, info in self.servers.items() if info.get("alive")}
             for sid in self.user_server.values():
-                if sid in active_loads:
+                if sid is not None and sid in active_loads:
                     active_loads[sid] += 1
             return active_loads
 
@@ -53,10 +66,15 @@ class Estado:
         with self.lock:
             return len(self.user_server)
 
+    def unassigned_users(self) -> list[int]:
+        """Retorna IDs ordenados de usuários que existem mas estão sem servidor (None)."""
+        with self.lock:
+            return sorted(uid for uid, sid in self.user_server.items() if sid is None)
+
     def add_user(self, user_id: int, name: str | None, server_id: int) -> str:
         """
         Insere um usuário de forma atômica no servidor especificado.
-        Retorna: 'ADDED', 'DUPLICATE' ou 'FULL'.
+        Retorna: 'ADDED' | 'DUPLICATE' | 'FULL' | 'NO_SERVER'.
         """
         with self.lock:
             if user_id in self.user_server:
@@ -64,7 +82,7 @@ class Estado:
 
             srv = self.servers.get(server_id)
             if not srv or not srv.get("alive"):
-                return "FULL"
+                return "NO_SERVER"
 
             if self.load_of(server_id) >= self.capacity:
                 return "FULL"
@@ -73,8 +91,47 @@ class Estado:
             self.user_names[user_id] = name
             return "ADDED"
 
+    def fail_server(self, server_id: int) -> list[int] | None:
+        """
+        Marca o servidor como morto (mantendo-o no dicionário para idempotência),
+        define user_server[uid] = None para seus usuários e retorna os órfãos ordenados.
+        Retorna None se o servidor for desconhecido ou já estiver morto.
+        """
+        with self.lock:
+            srv = self.servers.get(server_id)
+            if not srv or not srv.get("alive"):
+                return None
+
+            srv["alive"] = False
+            orphans = sorted(uid for uid, sid in self.user_server.items() if sid == server_id)
+            for uid in orphans:
+                self.user_server[uid] = None
+            return orphans
+
+    def apply_assignments(self, assignments: dict[int, int]) -> list[int]:
+        """
+        Aplica atribuições {user_id: server_id} respeitando servidor vivo e capacidade.
+        Retorna lista ordenada dos user_ids que não puderam ser aplicados.
+        """
+        with self.lock:
+            rejected: list[int] = []
+            current_loads = self.loads()
+
+            for uid in sorted(assignments):
+                sid = assignments[uid]
+                if sid not in current_loads or current_loads[sid] >= self.capacity:
+                    rejected.append(uid)
+                    continue
+                if uid in self.user_server:
+                    self.user_server[uid] = sid
+                    current_loads[sid] += 1
+                else:
+                    rejected.append(uid)
+
+            return rejected
+
     def snapshot(self) -> dict:
-        """Retorna cópia profunda do estado para replicação ou inspeção."""
+        """Retorna cópia rasa dos dicionários (valores simples) para replicação ou inspeção."""
         with self.lock:
             return {
                 "my_id": self.my_id,

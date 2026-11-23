@@ -65,6 +65,7 @@ except LookupError:
 CADASTRO_IP = str(cfg("CADASTRO_IP", "127.0.0.1"))
 CONTROL_PORT = cfg_int("CONTROL_PORT", 6001, 1, 65535)
 INITIAL_SERVER_ID = cfg_int("INITIAL_SERVER_ID", 0, 0)
+BIND_IP = str(cfg("BIND_IP", SERVER_IP))
 
 # Constantes do domínio (PDF)
 MAX_USERS_PER_SERVER = 5
