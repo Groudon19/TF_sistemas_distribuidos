@@ -2,10 +2,10 @@ import threading
 import time
 from unittest.mock import MagicMock
 
-from sd.common.config import port_for_server
-from sd.common.logger import MetricsLogger
+from sd.config import port_for_server
+from sd.config import MetricsLogger
 from sd.coordenador import Coordenador
-from sd.escalador import Escalador
+from sd.coordenador import Escalador
 from sd.estado import Estado
 from sd import spawner
 

@@ -1,59 +1,40 @@
-import socket
 import sys
-import time
+from pathlib import Path
 
-from sd.common import config
+RAIZ = Path(__file__).resolve().parent.parent
+if str(RAIZ) not in sys.path:
+    sys.path.insert(0, str(RAIZ))
 
-
-def query_digest(ip: str, port: int, timeout: float = 1.0) -> tuple[int, str] | None:
-    try:
-        with socket.create_connection((ip, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            sock.sendall(b"DIGEST\n")
-            data = sock.recv(256).decode("utf-8", errors="replace").strip()
-            if data.startswith("DIGEST_"):
-                parts = data.split("_", 2)
-                if len(parts) == 3:
-                    return int(parts[1]), parts[2]
-    except OSError:
-        return None
-    return None
+from sd.config import IP_SERVIDOR, MAX_SERVIDORES, enviar_e_receber, porta_do_servidor
 
 
-def main() -> int:
-    time.sleep(0.3)  # pequena margem para replicação em voo assentar
-    rows: list[tuple[int, int, str]] = []
-
-    for sid in range(config.MAX_SERVERS + 5):
+def verificar_consistencia(ids_servidores: list[int]) -> bool:
+    digests: dict[int, str] = {}
+    for sid in ids_servidores:
+        porta = porta_do_servidor(sid)
         try:
-            port = config.port_for_server(sid)
-        except ValueError:
-            break
-        res = query_digest(config.SERVER_IP, port)
-        if res is not None:
-            rows.append((sid, res[0], res[1]))
+            resp = enviar_e_receber(IP_SERVIDOR, porta, "DIGEST", timeout=1.5)
+            if resp and resp.startswith("DIGEST_"):
+                digests[sid] = resp
+        except OSError:
+            pass
 
-    if not rows:
-        print("Nenhum servidor ativo encontrado.")
-        return 1
+    if not digests:
+        print("Nenhum servidor ativo respondeu ao DIGEST.")
+        return False
 
-    print(f"{'ID':>4} | {'LAST_SEQ':>10} | {'CRC32':>10}")
-    print("-" * 30)
-    for sid, seq, crc in rows:
-        print(f"{sid:>4} | {seq:>10} | {crc:>10}")
+    for sid, dig in sorted(digests.items()):
+        print(f"Servidor {sid}: {dig}")
 
-    by_seq: dict[int, set[str]] = {}
-    for _, seq, crc in rows:
-        by_seq.setdefault(seq, set()).add(crc)
+    valores = set(digests.values())
+    if len(valores) == 1:
+        print("CONSISTENTE: todos os servidores possuem exatamente o mesmo estado.")
+        return True
 
-    divergent = {seq: crcs for seq, crcs in by_seq.items() if len(crcs) > 1}
-    if divergent:
-        print(f"\n[ERRO] Divergência de CRC detectada: {divergent}")
-        return 1
-
-    print("\n[OK] Todos os servidores com mesmo seq possuem CRC idêntico.")
-    return 0
+    print("DIVERGENCIA DETECTADA entre os servidores ativos!")
+    return False
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    ids = [int(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else list(range(MAX_SERVIDORES))
+    sys.exit(0 if verificar_consistencia(ids) else 1)

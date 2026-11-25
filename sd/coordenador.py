@@ -1,403 +1,724 @@
+import subprocess
+import sys
 import threading
 import time
 from typing import Callable
 
-from sd.common import config
-from sd.common.logger import MetricsLogger
-from sd.common.protocolo import (
-    ProtocolError,
-    fmt_ack_hello,
-    fmt_ack_kill,
-    fmt_ack_newuser,
-    fmt_ack_shutdown,
-    fmt_error,
-    fmt_digest,
-    parse_command,
-    parse_hello,
-    parse_kill,
-    parse_newuser,
-    parse_shutdown,
+from sd.config import (
+    BACKOFF_CRIACAO_SEG,
+    DIRETORIO_BASE,
+    DIRETORIO_LOGS,
+    ESPERA_NEWUSER_SEG,
+    ESPERA_REPLICACAO_SEG,
+    INTERVALO_ESCALADOR_SEG,
+    IP_CADASTRO,
+    IP_SERVIDOR,
+    LIMITE_FALHAS_CRIACAO,
+    MAX_SERVIDORES,
+    PORTA_CONTROLE,
+    TEMPO_OCIOSO_SEG,
+    TIMEOUT_CRIACAO_SEG,
+    TIMEOUT_INTERNO_SEG,
+    ErroProtocolo,
+    LoggerMetricas,
+    enviar_e_receber,
+    extrair_comando,
+    formatar_ack_hello,
+    formatar_ack_kill,
+    formatar_ack_newuser,
+    formatar_ack_shutdown,
+    formatar_digest,
+    formatar_erro,
+    formatar_newcoordinatorip,
+    formatar_newid,
+    interpretar_hello,
+    interpretar_kill,
+    interpretar_newuser,
+    interpretar_shutdown,
+    porta_do_servidor,
 )
-from sd.estado import Estado
-from sd.placement import balance_metrics, pick_server_for_new_user, reassign_orphans, servers_needed
+from sd.estado import (
+    Estado,
+    calcular_metricas_balanceamento,
+    escolher_servidor_ocioso,
+    escolher_servidor_para_usuario,
+    realocar_orfaos,
+    servidores_a_criar,
+    servidores_desejados,
+    servidores_necessarios,
+)
 
+
+# =====================================================================
+# Comunicação com o Cadastro e Gerenciamento de Processos Filhos
+# =====================================================================
+
+def _enviar_controle_cadastro(
+    msg: str,
+    ack_esperado: str,
+    logger: LoggerMetricas,
+    metrica_ok: str,
+    metrica_falha: str,
+    **extras,
+) -> bool:
+    t0 = time.monotonic()
+    ultimo_erro = ""
+    for tentativa in range(1, 4):
+        try:
+            resposta = enviar_e_receber(IP_CADASTRO, PORTA_CONTROLE, msg, timeout=TIMEOUT_INTERNO_SEG)
+            if resposta == ack_esperado:
+                latencia = round(time.monotonic() - t0, 4)
+                logger.registrar(metrica_ok, valor=latencia, tentativas=tentativa, **extras)
+                return True
+            ultimo_erro = f"resposta inesperada: {resposta!r}"
+        except OSError as exc:
+            ultimo_erro = str(exc)
+
+        if tentativa < 3:
+            time.sleep(0.5)
+
+    latencia = round(time.monotonic() - t0, 4)
+    logger.registrar(metrica_falha, valor=latencia, tentativas=3, erro=ultimo_erro, **extras)
+    return False
+
+
+def enviar_newid(id_servidor: int, logger: LoggerMetricas) -> bool:
+    """Informa NEWID_<id> ao Cadastro sem levantar exceção."""
+    try:
+        return _enviar_controle_cadastro(
+            formatar_newid(id_servidor),
+            f"ACK_NEWID_{id_servidor}",
+            logger,
+            metrica_ok="newid_enviado",
+            metrica_falha="newid_falhou",
+            servidor=id_servidor,
+        )
+    except Exception as exc:
+        logger.registrar("newid_falhou", valor=0.0, tentativas=0, erro=str(exc), servidor=id_servidor)
+        return False
+
+
+def enviar_newcoordinatorip(ip: str, porta: int, logger: LoggerMetricas) -> bool:
+    """Informa NEWCOORDINATORIP_<ip>_<porta> ao Cadastro."""
+    try:
+        return _enviar_controle_cadastro(
+            formatar_newcoordinatorip(ip, porta),
+            f"ACK_NEWCOORDINATORIP_{ip}_{porta}",
+            logger,
+            metrica_ok="newcoordinatorip_enviado",
+            metrica_falha="newcoordinatorip_falhou",
+            ip=ip,
+            porta=porta,
+        )
+    except Exception as exc:
+        logger.registrar("newcoordinatorip_falhou", valor=0.0, tentativas=0, erro=str(exc))
+        return False
+
+
+def iniciar_processo_servidor(id_servidor: int, ip_coord: str, porta_coord: int) -> subprocess.Popen:
+    """Inicia um novo processo de servidor com saída redirecionada para logs/."""
+    DIRETORIO_LOGS.mkdir(parents=True, exist_ok=True)
+    caminho_saida = DIRETORIO_LOGS / f"servidor_{id_servidor}.out"
+    arquivo_saida = caminho_saida.open("a", encoding="utf-8")
+
+    comando = [
+        sys.executable,
+        "-m",
+        "sd.servidor",
+        "--id",
+        str(id_servidor),
+        "--coord-ip",
+        ip_coord,
+        "--coord-port",
+        str(porta_coord),
+    ]
+    try:
+        return subprocess.Popen(
+            comando,
+            cwd=DIRETORIO_BASE,
+            stdout=arquivo_saida,
+            stderr=subprocess.STDOUT,
+        )
+    finally:
+        arquivo_saida.close()
+
+
+def encerrar_processo(proc: subprocess.Popen) -> None:
+    """Encerra suavemente um processo filho com fallback forçado após 1 s."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=1.0)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+# =====================================================================
+# Coordenador e Escalador Elástico
+# =====================================================================
 
 class Coordenador:
-    """Processa comandos de protocolo de forma serializada e coordena escalonamento e replicação."""
+    """Processa comandos do protocolo de forma serializada e coordena replicação e elasticidade."""
 
-    def __init__(self, state: Estado, logger: MetricsLogger, wait_sec: float = config.NEWUSER_WAIT_SEC):
-        self.state = state
+    def __init__(self, estado: Estado, logger: LoggerMetricas, tempo_espera: float = ESPERA_NEWUSER_SEG):
+        self.estado = estado
         self.logger = logger
-        self.wait_sec = wait_sec
-        self._op_lock = threading.Lock()
-        self._cond = threading.Condition(self._op_lock)
-        self._waiting = 0
-        self.escalador = None
+        self.tempo_espera = tempo_espera
+        self._lock_op = threading.Lock()
+        self._cond = threading.Condition(self._lock_op)
+        self._aguardando = 0
+        self.escalador: Escalador | None = None
         self.replicador = None
-        self._handlers: dict[str, Callable[[str], tuple[str, bool]]] = {
-            "NEWUSER": self.handle_newuser,
-            "KILL": self.handle_kill,
-            "HELLO": self.handle_hello,
-            "SHUTDOWN": self.handle_shutdown,
+        self.evento_mudanca_estado = threading.Event()
+        self._tratadores: dict[str, Callable[[str], tuple[str, bool]]] = {
+            "NEWUSER": self.tratar_newuser,
+            "KILL": self.tratar_kill,
+            "HELLO": self.tratar_hello,
+            "SHUTDOWN": self.tratar_shutdown,
         }
-        self.on_state_change_event = threading.Event()
 
-    def register_handler(self, prefix: str, fn: Callable[[str], tuple[str, bool]]) -> None:
-        self._handlers[prefix] = fn
+    def registrar_tratador(self, prefixo: str, func: Callable[[str], tuple[str, bool]]) -> None:
+        self._tratadores[prefixo] = func
 
-    def attach_scaler(self, escalador) -> None:
+    def anexar_escalador(self, escalador: "Escalador") -> None:
         self.escalador = escalador
 
-    def attach_replicator(self, replicador) -> None:
+    def anexar_replicador(self, replicador) -> None:
         self.replicador = replicador
 
-    def _emit(self, op_type: str, **data) -> int:
-        """Deve ser chamado sob _op_lock."""
+    def _emitir(self, tipo_op: str, **dados) -> int:
         if self.replicador is None:
             return 0
-        return self.replicador.append_locked(op_type, data)
+        return self.replicador.anexar_sob_lock(tipo_op, dados)
 
-    def _replicate(self, seq: int, budget: float = config.REPL_WAIT_SEC) -> None:
-        """Deve ser chamado fora de qualquer lock."""
+    def _replicar(self, seq: int, orcamento: float = ESPERA_REPLICACAO_SEG) -> None:
         if self.replicador is None or seq <= 0:
             return
-        timeout = max(0.2, min(budget, config.REPL_WAIT_SEC))
-        info = self.replicador.wait_replicated(seq, timeout=timeout)
-        if info["synced"] > 0 or info["lagging"] > 0:
-            self.logger.log(
+        timeout = max(0.2, min(orcamento, ESPERA_REPLICACAO_SEG))
+        info = self.replicador.aguardar_replicacao(seq, timeout=timeout)
+        if info["sincronizados"] > 0 or info["atrasados"] > 0:
+            self.logger.registrar(
                 "replicacao_espera",
-                valor=info["elapsed"],
+                valor=info["decorrido"],
                 seq=seq,
-                sincronizados=info["synced"],
-                atrasados=info["lagging"],
+                sincronizados=info["sincronizados"],
+                atrasados=info["atrasados"],
             )
 
-    def _balance_snapshot(self) -> dict:
-        loads = self.state.loads()
-        metrics = balance_metrics(loads)
-        total_u = self.state.total_users()
-        needed = servers_needed(total_u, self.state.capacity)
-        active_count = metrics["servidores"]
-
-        razao = round(active_count / needed, 4) if (total_u > 0 and needed > 0) else None
+    def _foto_balanceamento(self) -> dict:
+        cargas = self.estado.cargas()
+        metricas = calcular_metricas_balanceamento(cargas)
+        total_u = self.estado.total_usuarios()
+        necessarios = servidores_necessarios(total_u, self.estado.capacidade)
+        ativos = metricas["servidores"]
+        razao = round(ativos / necessarios, 4) if (total_u > 0 and necessarios > 0) else None
         return {
-            **metrics,
+            **metricas,
             "razao_servidores": razao,
-            "sem_servidor": len(self.state.unassigned_users()),
+            "sem_servidor": len(self.estado.usuarios_sem_servidor()),
         }
 
-    def _emit_balance(self, evento: str, snap: dict) -> None:
-        self.logger.log("desbalanceamento", valor=snap["desbalanceamento"], evento=evento)
-        self.logger.log("desvio_padrao_usuarios", valor=snap["desvio_padrao"], evento=evento)
-        if snap["razao_servidores"] is not None:
-            self.logger.log("razao_servidores_ativos", valor=snap["razao_servidores"], evento=evento)
-        self.logger.log("usuarios_sem_servidor", valor=snap["sem_servidor"], evento=evento)
+    def _registrar_balanceamento(self, evento: str, foto: dict) -> None:
+        self.logger.registrar("desbalanceamento", valor=foto["desbalanceamento"], evento=evento)
+        self.logger.registrar("desvio_padrao_usuarios", valor=foto["desvio_padrao"], evento=evento)
+        if foto["razao_servidores"] is not None:
+            self.logger.registrar("razao_servidores_ativos", valor=foto["razao_servidores"], evento=evento)
+        self.logger.registrar("usuarios_sem_servidor", valor=foto["sem_servidor"], evento=evento)
 
-    def _place_pending_locked(self) -> dict[int, int]:
-        """Deve ser chamado sob _op_lock. Retorna {uid: sid} efetivamente aplicados."""
-        orphans = self.state.unassigned_users()
-        if not orphans:
+    def _alocar_pendentes_sob_lock(self) -> dict[int, int]:
+        orfaos = self.estado.usuarios_sem_servidor()
+        if not orfaos:
             return {}
-        assignments, _ = reassign_orphans(orphans, self.state.loads(), self.state.capacity)
-        if not assignments:
+        atribuicoes, _ = realocar_orfaos(orfaos, self.estado.cargas(), self.estado.capacidade)
+        if not atribuicoes:
             return {}
-        rejected = set(self.state.apply_assignments(assignments))
-        return {uid: sid for uid, sid in assignments.items() if uid not in rejected}
+        rejeitados = set(self.estado.aplicar_atribuicoes(atribuicoes))
+        return {uid: sid for uid, sid in atribuicoes.items() if uid not in rejeitados}
 
-    def handle_line(self, line: str) -> tuple[str, bool]:
+    def tratar_digest(self, _linha: str) -> tuple[str, bool]:
+        """Retorna DIGEST_<topo>_<crc> de forma atômica sob _lock_op."""
+        with self._lock_op:
+            topo = self.replicador.log_ops.topo() if self.replicador is not None else 0
+            crc = self.estado.resumo_crc()
+        return formatar_digest(topo, crc), False
+
+    def tratar_linha(self, linha: str) -> tuple[str, bool]:
         try:
-            cmd = parse_command(line)
-            handler = self._handlers.get(cmd)
-            if handler is None:
-                return fmt_error("INVALID_COMMAND"), False
-            return handler(line)
-        except ProtocolError as exc:
-            return fmt_error(exc.code), False
+            cmd = extrair_comando(linha)
+            tratador = self._tratadores.get(cmd)
+            if tratador is None:
+                return formatar_erro("INVALID_COMMAND"), False
+            return tratador(linha)
+        except ConnectionResetError:
+            raise
+        except ErroProtocolo as exc:
+            return formatar_erro(exc.codigo), False
         except Exception as exc:
-            self.logger.log("erro_interno", valor=1, erro=str(exc), linha=line.strip())
-            return fmt_error("INTERNAL"), False
+            self.logger.registrar("erro_interno", valor=1, erro=str(exc), linha=linha.strip())
+            return formatar_erro("INTERNAL"), False
 
-    def handle_newuser(self, line: str) -> tuple[str, bool]:
-        user_id, nome = parse_newuser(line)
-        self.logger.log("newuser_recebido", valor=1, usuario=user_id)
+    def tratar_newuser(self, linha: str) -> tuple[str, bool]:
+        id_usuario, nome = interpretar_newuser(linha)
+        self.logger.registrar("newuser_recebido", valor=1, usuario=id_usuario)
 
-        if not self.state.is_coordinator:
-            self.logger.log("newuser_rejeitado", valor=1, usuario=user_id, motivo="NOT_COORDINATOR")
-            return fmt_error("NOT_COORDINATOR"), False
+        if not self.estado.eh_coordenador:
+            self.logger.registrar("newuser_rejeitado", valor=1, usuario=id_usuario, motivo="NOT_COORDINATOR")
+            return formatar_erro("NOT_COORDINATOR"), False
 
-        start_wait = time.monotonic()
-        deadline = start_wait + self.wait_sec
-        counted_waiting = False
-        snap: dict | None = None
-        target: int | None = None
+        inicio_espera = time.monotonic()
+        prazo = inicio_espera + self.tempo_espera
+        contou_espera = False
+        foto: dict | None = None
+        destino: int | None = None
         total_u = 0
-        active_srvs = 0
-        result = "FULL"
-        op_seq = 0
+        ativos = 0
+        resultado = "FULL"
+        seq_op = 0
 
         with self._cond:
             try:
                 while True:
-                    if self.state.has_user(user_id):
-                        result = "DUPLICATE"
+                    if self.estado.possui_usuario(id_usuario):
+                        resultado = "DUPLICATE"
                         break
 
-                    target = pick_server_for_new_user(self.state.loads(), self.state.capacity)
-                    if target is not None:
-                        result = self.state.add_user(user_id, nome, target)
-                        if result == "ADDED":
-                            op_seq = self._emit("USER_ADD", uid=user_id, nome=nome, sid=target)
-                            snap = self._balance_snapshot()
+                    destino = escolher_servidor_para_usuario(self.estado.cargas(), self.estado.capacidade)
+                    if destino is not None:
+                        resultado = self.estado.adicionar_usuario(id_usuario, nome, destino)
+                        if resultado == "ADDED":
+                            seq_op = self._emitir("USER_ADD", uid=id_usuario, nome=nome, sid=destino)
+                            foto = self._foto_balanceamento()
                         break
 
                     if self.escalador is None:
-                        result = "FULL"
+                        resultado = "FULL"
                         break
 
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        result = "TIMEOUT"
+                    restante = prazo - time.monotonic()
+                    if restante <= 0:
+                        resultado = "TIMEOUT"
                         break
 
-                    if not counted_waiting:
-                        self._waiting += 1
-                        counted_waiting = True
-                        self.escalador.notify()
+                    if not contou_espera:
+                        self._aguardando += 1
+                        contou_espera = True
+                        self.escalador.notificar()
 
-                    self._cond.wait(timeout=remaining)
+                    self._cond.wait(timeout=restante)
             finally:
-                if counted_waiting:
-                    self._waiting -= 1
+                if contou_espera:
+                    self._aguardando -= 1
 
-            if result in ("FULL", "TIMEOUT", "NO_SERVER"):
-                total_u = self.state.total_users()
-                active_srvs = len(self.state.alive_server_ids())
+            if resultado in ("FULL", "TIMEOUT", "NO_SERVER"):
+                total_u = self.estado.total_usuarios()
+                ativos = len(self.estado.ids_servidores_ativos())
 
-        waited = round(time.monotonic() - start_wait, 4)
-        if counted_waiting:
-            self.logger.log("newuser_aguardou", valor=waited, usuario=user_id, resultado=result)
+        esperou = round(time.monotonic() - inicio_espera, 4)
+        if contou_espera:
+            self.logger.registrar("newuser_aguardou", valor=esperou, usuario=id_usuario, resultado=resultado)
 
-        if result == "ADDED":
+        if resultado == "ADDED":
+            self.evento_mudanca_estado.set()
             if self.escalador is not None:
-                self.escalador.notify()
-            remaining_budget = max(0.2, (self.wait_sec + config.REPL_WAIT_SEC) - waited)
-            self._replicate(op_seq, budget=remaining_budget)
-            self.logger.log("newuser_adicionado", valor=1, usuario=user_id, servidor=target)
-            assert snap is not None
-            self._emit_balance("newuser", snap)
-            return fmt_ack_newuser(user_id), False
+                self.escalador.notificar()
+            orcamento_restante = max(0.2, (self.tempo_espera + ESPERA_REPLICACAO_SEG) - esperou)
+            self._replicar(seq_op, orcamento=orcamento_restante)
+            self.logger.registrar("newuser_adicionado", valor=1, usuario=id_usuario, servidor=destino)
+            assert foto is not None
+            self._registrar_balanceamento("newuser", foto)
+            return formatar_ack_newuser(id_usuario), False
 
-        if result == "DUPLICATE":
-            self.logger.log("newuser_duplicado", valor=1, usuario=user_id)
-            return fmt_ack_newuser(user_id), False
+        if resultado == "DUPLICATE":
+            self.logger.registrar("newuser_duplicado", valor=1, usuario=id_usuario)
+            return formatar_ack_newuser(id_usuario), False
 
-        self.logger.log(
+        self.logger.registrar(
             "newuser_rejeitado",
             valor=1,
-            usuario=user_id,
+            usuario=id_usuario,
             motivo="NO_CAPACITY",
             usuarios=total_u,
-            servidores_ativos=active_srvs,
+            servidores_ativos=ativos,
         )
-        return fmt_error("NO_CAPACITY"), False
+        return formatar_erro("NO_CAPACITY"), False
 
-    def handle_kill(self, line: str) -> tuple[str, bool]:
-        server_id = parse_kill(line)
-        self.logger.log("kill_recebido", valor=1, alvo=server_id)
+    def tratar_kill(self, linha: str) -> tuple[str, bool]:
+        id_servidor = interpretar_kill(linha)
+        self.logger.registrar("kill_recebido", valor=1, alvo=id_servidor)
 
-        if server_id == self.state.my_id:
-            return fmt_ack_kill(server_id), True
+        if id_servidor == self.estado.meu_id:
+            return formatar_ack_kill(id_servidor), True
 
-        if not self.state.is_coordinator:
-            return fmt_error("NOT_COORDINATOR"), False
+        if not self.estado.eh_coordenador:
+            return formatar_erro("NOT_COORDINATOR"), False
 
-        if not self.state.is_known_server(server_id):
-            return fmt_error("UNKNOWN_SERVER"), False
+        if not self.estado.servidor_conhecido(id_servidor):
+            return formatar_erro("UNKNOWN_SERVER"), False
 
-        with self._op_lock:
-            was_starting = self.state.abort_starting(server_id)
-            cancel_seq = self._emit("SRV_DEAD", id=server_id) if was_starting else 0
+        with self._lock_op:
+            estava_iniciando = self.estado.abortar_inicializacao(id_servidor)
+            seq_cancelamento = self._emitir("SRV_DEAD", id=id_servidor) if estava_iniciando else 0
 
-        if was_starting:
-            self._replicate(cancel_seq)
+        if estava_iniciando:
+            self._replicar(seq_cancelamento)
             if self.escalador is not None:
-                self.escalador.terminate_process(server_id)
-            self.logger.log("servidor_cancelado", valor=1, servidor=server_id)
-            return fmt_ack_kill(server_id), False
+                self.escalador.encerrar_processo_servidor(id_servidor)
+            self.logger.registrar("servidor_cancelado", valor=1, servidor=id_servidor)
+            return formatar_ack_kill(id_servidor), False
 
-        last_seq = 0
-        with self._op_lock:
+        ultimo_seq = 0
+        with self._lock_op:
             t0 = time.monotonic()
-            orphans = self.state.fail_server(server_id)
-            if orphans is None:
-                already_dead = True
-                migrated_count = 0
-                pending_count = 0
-                duration = 0.0
-                snap = None
+            orfaos = self.estado.derrubar_servidor(id_servidor)
+            if orfaos is None:
+                ja_morto = True
+                qtd_migrados = 0
+                qtd_pendentes = 0
+                duracao = 0.0
+                foto = None
             else:
-                already_dead = False
-                last_seq = self._emit("SRV_DEAD", id=server_id)
-                assignments, pending = reassign_orphans(orphans, self.state.loads(), self.state.capacity)
-                rejected = set(self.state.apply_assignments(assignments))
-                applied_map = {uid: sid for uid, sid in assignments.items() if uid not in rejected}
-                pending_set = set(pending) | rejected
+                ja_morto = False
+                ultimo_seq = self._emitir("SRV_DEAD", id=id_servidor)
+                atribuicoes, pendentes = realocar_orfaos(orfaos, self.estado.cargas(), self.estado.capacidade)
+                rejeitados = set(self.estado.aplicar_atribuicoes(atribuicoes))
+                mapa_aplicados = {uid: sid for uid, sid in atribuicoes.items() if uid not in rejeitados}
+                conjunto_pendentes = set(pendentes) | rejeitados
 
-                for uid in sorted(orphans):
-                    final_sid = applied_map.get(uid)  # None se ficou pendente
-                    last_seq = self._emit("USER_MOVE", uid=uid, sid=final_sid)
+                for uid in sorted(orfaos):
+                    sid_final = mapa_aplicados.get(uid)
+                    ultimo_seq = self._emitir("USER_MOVE", uid=uid, sid=sid_final)
 
-                migrated_count = len(applied_map)
-                pending_count = len(pending_set)
-                duration = round(time.monotonic() - t0, 6)
-                snap = self._balance_snapshot()
+                qtd_migrados = len(mapa_aplicados)
+                qtd_pendentes = len(conjunto_pendentes)
+                duracao = round(time.monotonic() - t0, 6)
+                foto = self._foto_balanceamento()
 
-        if already_dead:
-            self.logger.log("kill_duplicado", valor=1, alvo=server_id)
-            return fmt_ack_kill(server_id), False
+        if ja_morto:
+            self.logger.registrar("kill_duplicado", valor=1, alvo=id_servidor)
+            return formatar_ack_kill(id_servidor), False
 
+        self.evento_mudanca_estado.set()
         if self.replicador is not None:
-            self.replicador.remove_follower(server_id)
-        self._replicate(last_seq)
+            self.replicador.remover_seguidor(id_servidor)
+        self._replicar(ultimo_seq)
 
-        self.logger.log("servidor_desativado", valor=1, servidor=server_id, motivo="kill")
-        self.logger.log("usuarios_migrados", valor=migrated_count, evento="kill", servidor=server_id)
-        self.logger.log("tempo_redistribuicao", valor=duration, servidor=server_id)
-        self.logger.log("usuarios_pendentes", valor=pending_count, servidor=server_id)
-        assert snap is not None
-        self._emit_balance("kill", snap)
+        self.logger.registrar("servidor_desativado", valor=1, servidor=id_servidor, motivo="kill")
+        self.logger.registrar("usuarios_migrados", valor=qtd_migrados, evento="kill", servidor=id_servidor)
+        self.logger.registrar("tempo_redistribuicao", valor=duracao, servidor=id_servidor)
+        self.logger.registrar("usuarios_pendentes", valor=qtd_pendentes, servidor=id_servidor)
+        assert foto is not None
+        self._registrar_balanceamento("kill", foto)
 
         if self.escalador is not None:
-            self.escalador.request_shutdown(server_id)
-            self.escalador.notify()
+            self.escalador.solicitar_desligamento(id_servidor)
+            self.escalador.notificar()
 
-        return fmt_ack_kill(server_id), False
+        return formatar_ack_kill(id_servidor), False
 
-    def handle_hello(self, line: str) -> tuple[str, bool]:
-        server_id = parse_hello(line)
-        if not self.state.is_coordinator:
-            return fmt_error("NOT_COORDINATOR"), False
+    def tratar_hello(self, linha: str) -> tuple[str, bool]:
+        id_servidor = interpretar_hello(linha)
+        if not self.estado.eh_coordenador:
+            return formatar_erro("NOT_COORDINATOR"), False
 
-        now = time.monotonic()
-        last_seq = 0
-        addr: tuple[str, int] | None = None
+        agora = time.monotonic()
+        ultimo_seq = 0
+        endereco: tuple[str, int] | None = None
 
         with self._cond:
-            reserved_ts = self.state.reserved_at(server_id)
-            status = self.state.mark_active(server_id)
-            placed_map: dict[int, int] = {}
-            snap: dict | None = None
-            if status == "ACTIVATED":
-                addr = self.state.address_of(server_id)
-                last_seq = self._emit("SRV_ACTIVE", id=server_id)
-                placed_map = self._place_pending_locked()
-                for uid, sid in sorted(placed_map.items()):
-                    last_seq = self._emit("USER_MOVE", uid=uid, sid=sid)
-                snap = self._balance_snapshot()
+            ts_reserva = self.estado.instante_reserva(id_servidor)
+            situacao = self.estado.marcar_ativo(id_servidor)
+            mapa_realocados: dict[int, int] = {}
+            foto: dict | None = None
+            if situacao == "ACTIVATED":
+                endereco = self.estado.endereco_de(id_servidor)
+                ultimo_seq = self._emitir("SRV_ACTIVE", id=id_servidor)
+                mapa_realocados = self._alocar_pendentes_sob_lock()
+                for uid, sid in sorted(mapa_realocados.items()):
+                    ultimo_seq = self._emitir("USER_MOVE", uid=uid, sid=sid)
+                foto = self._foto_balanceamento()
                 self._cond.notify_all()
 
-        if status == "ACTIVATED":
-            if self.replicador is not None and addr is not None:
-                self.replicador.add_follower(server_id, addr[0], addr[1])
-            elapsed = round(now - reserved_ts, 4) if reserved_ts is not None else 0.0
-            self.logger.log("tempo_novo_servidor", valor=elapsed, servidor=server_id)
-            self.logger.log("usuarios_migrados", valor=0, evento="criacao", servidor=server_id)
-            self.logger.log("usuarios_recolocados", valor=len(placed_map), servidor=server_id)
-            assert snap is not None
-            self._emit_balance("criacao", snap)
+        if situacao == "ACTIVATED":
+            self.evento_mudanca_estado.set()
+            if self.replicador is not None and endereco is not None:
+                self.replicador.adicionar_seguidor(id_servidor, endereco[0], endereco[1])
+            decorrido = round(agora - ts_reserva, 4) if ts_reserva is not None else 0.0
+            self.logger.registrar("tempo_novo_servidor", valor=decorrido, servidor=id_servidor)
+            self.logger.registrar("usuarios_migrados", valor=0, evento="criacao", servidor=id_servidor)
+            self.logger.registrar("usuarios_recolocados", valor=len(mapa_realocados), servidor=id_servidor)
+            assert foto is not None
+            self._registrar_balanceamento("criacao", foto)
             if self.escalador is not None:
-                self.escalador.on_server_ready(server_id)
-                self.escalador.notify()
-            return fmt_ack_hello(server_id), False
+                self.escalador.ao_ficar_pronto(id_servidor)
+                self.escalador.notificar()
+            return formatar_ack_hello(id_servidor), False
 
-        if status == "ALREADY_ACTIVE":
-            return fmt_ack_hello(server_id), False
+        if situacao == "ALREADY_ACTIVE":
+            return formatar_ack_hello(id_servidor), False
 
-        return fmt_error("UNKNOWN_SERVER"), False
+        return formatar_erro("UNKNOWN_SERVER"), False
 
-    def handle_shutdown(self, line: str) -> tuple[str, bool]:
-        server_id = parse_shutdown(line)
-        if server_id != self.state.my_id:
-            return fmt_error("WRONG_SERVER"), False
-        return fmt_ack_shutdown(server_id), True
+    def tratar_shutdown(self, linha: str) -> tuple[str, bool]:
+        id_servidor = interpretar_shutdown(linha)
+        if id_servidor != self.estado.meu_id:
+            return formatar_erro("WRONG_SERVER"), False
+        return formatar_ack_shutdown(id_servidor), True
 
     # ------------------------------------------------------------------
-    # Métodos públicos para o Escalador
+    # Métodos auxiliares usados pelo Escalador
     # ------------------------------------------------------------------
 
-    def scaling_view(self) -> dict:
-        with self._op_lock:
+    def visao_escalonamento(self) -> dict:
+        with self._lock_op:
             return {
-                "users": self.state.total_users(),
-                "waiting": self._waiting,
-                "pending": len(self.state.unassigned_users()),
-                "capacity": self.state.capacity,
-                "active": self.state.alive_server_ids(),
-                "starting": self.state.starting_server_ids(),
-                "idle": self.state.idle_server_ids(),
+                "usuarios": self.estado.total_usuarios(),
+                "aguardando": self._aguardando,
+                "pendentes": len(self.estado.usuarios_sem_servidor()),
+                "capacidade": self.estado.capacidade,
+                "ativos": self.estado.ids_servidores_ativos(),
+                "iniciando": self.estado.ids_servidores_iniciando(),
+                "ociosos": self.estado.ids_servidores_ociosos(),
             }
 
-    def reserve_servers(self, n: int) -> list[int]:
-        reserved: list[int] = []
-        with self._op_lock:
-            for _ in range(n):
+    def reservar_servidores(self, qtd: int) -> list[int]:
+        reservados: list[int] = []
+        with self._lock_op:
+            for _ in range(qtd):
                 try:
-                    sid = self.state.reserve_server(config.SERVER_IP, config.port_for_server)
-                    port = config.port_for_server(sid)
-                    self._emit("SRV_RESERVED", id=sid, ip=config.SERVER_IP, port=port)
-                    reserved.append(sid)
+                    sid = self.estado.reservar_servidor(IP_SERVIDOR, porta_do_servidor)
+                    porta = porta_do_servidor(sid)
+                    self._emitir("SRV_RESERVED", id=sid, ip=IP_SERVIDOR, port=porta)
+                    reservados.append(sid)
                 except ValueError:
                     break
-        return reserved
+        return reservados
 
-    def abort_starting(self, server_id: int, motivo: str) -> bool:
+    def abortar_iniciando(self, id_servidor: int, motivo: str) -> bool:
         seq = 0
-        with self._op_lock:
-            aborted = self.state.abort_starting(server_id)
-            if aborted:
-                seq = self._emit("SRV_DEAD", id=server_id)
-        if aborted:
-            self._replicate(seq)
-            self.logger.log("servidor_abortado", valor=1, servidor=server_id, motivo=motivo)
-        return aborted
+        with self._lock_op:
+            abortado = self.estado.abortar_inicializacao(id_servidor)
+            if abortado:
+                seq = self._emitir("SRV_DEAD", id=id_servidor)
+        if abortado:
+            self._replicar(seq)
+            self.logger.registrar("servidor_abortado", valor=1, servidor=id_servidor, motivo=motivo)
+        return abortado
 
-    def retire_idle(self, server_id: int, idle_for: float) -> bool:
+    def desativar_ocioso(self, id_servidor: int, tempo_ocioso: float) -> bool:
         seq = 0
-        with self._op_lock:
-            retired = self.state.retire_if_idle(server_id)
-            if retired:
-                seq = self._emit("SRV_DEAD", id=server_id)
-                snap = self._balance_snapshot()
+        with self._lock_op:
+            desativado = self.estado.desativar_se_ocioso(id_servidor)
+            if desativado:
+                seq = self._emitir("SRV_DEAD", id=id_servidor)
+                foto = self._foto_balanceamento()
             else:
-                snap = None
-        if retired:
+                foto = None
+        if desativado:
             if self.replicador is not None:
-                self.replicador.remove_follower(server_id)
-            self._replicate(seq)
-            self.logger.log("servidor_desativado", valor=1, servidor=server_id, motivo="ocioso")
-            self.logger.log("tempo_desativacao_ocioso", valor=round(idle_for, 4), servidor=server_id)
-            assert snap is not None
-            self._emit_balance("desativacao", snap)
-        return retired
-    
-    def handle_digest(self, _line: str) -> tuple[str, bool]:
-        """Retorna DIGEST_<head>_<crc> de forma atômica sob _op_lock."""
-        with self._op_lock:
-            head = self.replicador.oplog.head() if self.replicador is not None else 0
-            crc = self.state.digest()
-        return fmt_digest(head, crc), False
-    
-    def handle_line(self, line: str) -> tuple[str, bool]:
-        try:
-            cmd = parse_command(line)
-            handler = self._handlers.get(cmd)
-            if handler is None:
-                return fmt_error("INVALID_COMMAND"), False
-            return handler(line)
-        except ConnectionResetError:
-            raise
-        except ProtocolError as exc:
-            return fmt_error(exc.code), False
-        except Exception as exc:
-            self.logger.log("erro_interno", valor=1, erro=str(exc), linha=line.strip())
-            return fmt_error("INTERNAL"), False
+                self.replicador.remover_seguidor(id_servidor)
+            self._replicar(seq)
+            self.logger.registrar("servidor_desativado", valor=1, servidor=id_servidor, motivo="ocioso")
+            self.logger.registrar("tempo_desativacao_ocioso", valor=round(tempo_ocioso, 4), servidor=id_servidor)
+            assert foto is not None
+            self._registrar_balanceamento("desativacao", foto)
+        return desativado
+
+
+class Escalador:
+    """Controlador reativo e periódico de elasticidade (criação e remoção de servidores)."""
+
+    def __init__(
+        self,
+        coordenador: Coordenador,
+        logger: LoggerMetricas,
+        func_criar: Callable[[int, str, int], subprocess.Popen] = iniciar_processo_servidor,
+        func_newid: Callable[[int, LoggerMetricas], bool] = enviar_newid,
+        func_shutdown: Callable[[str, int, int], bool] | None = None,
+        func_encerrar: Callable[[subprocess.Popen], None] = encerrar_processo,
+        func_tempo: Callable[[], float] = time.monotonic,
+    ):
+        self.coordenador = coordenador
+        self.logger = logger
+        self.func_criar = func_criar
+        self.func_newid = func_newid
+        self.func_shutdown = func_shutdown
+        self.func_encerrar = func_encerrar
+        self.func_tempo = func_tempo
+
+        self._lock = threading.Lock()
+        self._processos: dict[int, subprocess.Popen] = {}
+        self._ocioso_desde: dict[int, float] = {}
+        self._falhas_consecutivas = 0
+        self._pausado_ate = 0.0
+        self._no_limite = False
+
+        self._acordar = threading.Event()
+        self._parar = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def iniciar(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._parar.clear()
+        self._thread = threading.Thread(target=self._laco, name="Escalador", daemon=True)
+        self._thread.start()
+
+    def parar(self) -> None:
+        self._parar.set()
+        self._acordar.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def notificar(self) -> None:
+        self._acordar.set()
+
+    def ao_ficar_pronto(self, _id_servidor: int) -> None:
+        with self._lock:
+            self._falhas_consecutivas = 0
+            self._pausado_ate = 0.0
+
+    def encerrar_processo_servidor(self, id_servidor: int) -> None:
+        with self._lock:
+            proc = self._processos.pop(id_servidor, None)
+        if proc is not None:
+            self.func_encerrar(proc)
+
+    def solicitar_desligamento(self, id_servidor: int) -> None:
+        def _tarefa():
+            endereco = self.coordenador.estado.endereco_de(id_servidor)
+            ok = False
+            if endereco is not None and self.func_shutdown is not None:
+                ip, porta = endereco
+                try:
+                    ok = self.func_shutdown(ip, porta, id_servidor)
+                except Exception:
+                    ok = False
+            if not ok:
+                self.encerrar_processo_servidor(id_servidor)
+            else:
+                with self._lock:
+                    self._processos.pop(id_servidor, None)
+
+        threading.Thread(target=_tarefa, daemon=True).start()
+
+    def _laco(self) -> None:
+        while not self._parar.is_set():
+            self._acordar.wait(timeout=INTERVALO_ESCALADOR_SEG)
+            self._acordar.clear()
+            if self._parar.is_set():
+                break
+            try:
+                self.avaliar()
+            except Exception as exc:
+                self.logger.registrar("erro_escalador", valor=1, erro=str(exc))
+
+    def _registrar_falha_criacao(self, agora: float) -> None:
+        pausou_agora = False
+        with self._lock:
+            self._falhas_consecutivas += 1
+            falhas = self._falhas_consecutivas
+            if falhas >= LIMITE_FALHAS_CRIACAO:
+                self._pausado_ate = agora + BACKOFF_CRIACAO_SEG
+                pausou_agora = True
+
+        if pausou_agora:
+            self.logger.registrar("spawn_pausado", valor=BACKOFF_CRIACAO_SEG, falhas=falhas)
+
+    def avaliar(self) -> None:
+        agora = self.func_tempo()
+
+        with self._lock:
+            snapshot_procs = list(self._processos.items())
+        pids_mortos: set[int] = set()
+        for sid, proc in snapshot_procs:
+            if proc.poll() is not None:
+                pids_mortos.add(sid)
+
+        visao = self.coordenador.visao_escalonamento()
+        iniciando_set = set(visao["iniciando"])
+
+        mortos_orfaos = pids_mortos - iniciando_set
+        if mortos_orfaos:
+            with self._lock:
+                for sid in mortos_orfaos:
+                    self._processos.pop(sid, None)
+
+        for sid in visao["iniciando"]:
+            if sid in pids_mortos:
+                if self.coordenador.abortar_iniciando(sid, "processo_morreu"):
+                    self.encerrar_processo_servidor(sid)
+                    self.logger.registrar("spawn_falhou", valor=1, servidor=sid)
+                    self._registrar_falha_criacao(agora)
+                continue
+
+            res_em = self.coordenador.estado.instante_reserva(sid)
+            if res_em is not None and (agora - res_em) > TIMEOUT_CRIACAO_SEG:
+                if self.coordenador.abortar_iniciando(sid, "timeout"):
+                    self.encerrar_processo_servidor(sid)
+                    self.logger.registrar("spawn_timeout", valor=round(agora - res_em, 4), servidor=sid)
+                    self._registrar_falha_criacao(agora)
+
+        visao = self.coordenador.visao_escalonamento()
+        atual = len(visao["ativos"]) + len(visao["iniciando"])
+        desejado = servidores_desejados(visao["usuarios"], visao["aguardando"], visao["capacidade"])
+
+        with self._lock:
+            pausado = agora < self._pausado_ate
+
+        if not pausado:
+            qtd = servidores_a_criar(desejado, atual, MAX_SERVIDORES)
+            if qtd > 0:
+                self._no_limite = False
+                if visao["pendentes"] > 0:
+                    motivo = "pendentes"
+                elif visao["aguardando"] > 0:
+                    motivo = "demanda"
+                else:
+                    motivo = "limite"
+
+                porta_coord = porta_do_servidor(self.coordenador.estado.meu_id)
+                novos_ids = self.coordenador.reservar_servidores(qtd)
+                for sid in novos_ids:
+                    try:
+                        proc = self.func_criar(sid, IP_SERVIDOR, porta_coord)
+                        with self._lock:
+                            self._processos[sid] = proc
+                        threading.Thread(
+                            target=self.func_newid, args=(sid, self.logger), daemon=True
+                        ).start()
+                        self.logger.registrar("servidor_criado", valor=1, servidor=sid, motivo=motivo)
+                    except Exception as exc:
+                        self.coordenador.abortar_iniciando(sid, "erro_popen")
+                        self.logger.registrar("spawn_falhou", valor=1, servidor=sid, erro=str(exc))
+                        self._registrar_falha_criacao(agora)
+            elif desejado > MAX_SERVIDORES and atual >= MAX_SERVIDORES:
+                if not self._no_limite:
+                    self._no_limite = True
+                    self.logger.registrar("limite_servidores", valor=MAX_SERVIDORES)
+            else:
+                self._no_limite = False
+
+        ociosos_atuais = set(visao["ociosos"])
+        with self._lock:
+            for sid in ociosos_atuais:
+                self._ocioso_desde.setdefault(sid, agora)
+            for sid in list(self._ocioso_desde.keys()):
+                if sid not in ociosos_atuais:
+                    del self._ocioso_desde[sid]
+            copia_ociosos = dict(self._ocioso_desde)
+
+        if desejado < atual and copia_ociosos:
+            candidato = escolher_servidor_ocioso(copia_ociosos, agora, TEMPO_OCIOSO_SEG)
+            if candidato is not None:
+                tempo_ocioso = agora - copia_ociosos[candidato]
+                if self.coordenador.desativar_ocioso(candidato, tempo_ocioso):
+                    with self._lock:
+                        self._ocioso_desde.pop(candidato, None)
+                    self.solicitar_desligamento(candidato)

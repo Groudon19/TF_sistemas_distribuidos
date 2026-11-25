@@ -1,5 +1,5 @@
 import pytest
-from sd.common.protocolo import (
+from sd.rede_protocolo import (
     ProtocolError,
     escape_content,
     fmt_ack,

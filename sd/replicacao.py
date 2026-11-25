@@ -5,374 +5,380 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from sd.common import config
-from sd.common.logger import MetricsLogger
-from sd.common.net import LineReader, send_line
-from sd.common.protocolo import ProtocolError, fmt_digest, fmt_repl, parse_repl
+from sd import config
+from sd.config import (
+    ATRASO_RECONEXAO_REPL_SEG,
+    DIRETORIO_LOGS,
+    ESPERA_REPLICACAO_SEG,
+    TIMEOUT_LINK_REPL_SEG,
+    ErroProtocolo,
+    LeitorLinha,
+    LoggerMetricas,
+    enviar_linha,
+    formatar_digest,
+    formatar_repl,
+    interpretar_repl,
+)
 from sd.estado import Estado
 
 
-class OpLog:
+class LogOperacoes:
     """Log ordenado de operações em memória e persistido em JSONL."""
 
-    def __init__(self, node_id: int, log_dir: Path = config.LOGS_DIR):
-        self.node_id = node_id
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.log_dir / f"oplog_{node_id}.jsonl"
+    def __init__(self, id_no: int, dir_logs: Path = DIRETORIO_LOGS):
+        self.id_no = id_no
+        self.dir_logs = Path(dir_logs)
+        self.dir_logs.mkdir(parents=True, exist_ok=True)
+        self.caminho = self.dir_logs / f"oplog_{id_no}.jsonl"
 
-        if self.path.exists():
-            backup = self.log_dir / f"oplog_{node_id}_{int(time.time())}.bak.jsonl"
+        if self.caminho.exists():
+            backup = self.dir_logs / f"oplog_{id_no}_{int(time.time())}.bak.jsonl"
             try:
-                self.path.rename(backup)
+                self.caminho.rename(backup)
             except OSError:
                 pass
 
         self._lock = threading.Lock()
-        self._ops: list[dict] = []
-        self._file = self.path.open("a", encoding="utf-8")
+        self._operacoes: list[dict] = []
+        self._arquivo = self.caminho.open("a", encoding="utf-8")
 
-    def append(self, op_type: str, data: dict, epoch: int = 1) -> dict:
+    def anexar(self, tipo: str, dados: dict, epoca: int = 1) -> dict:
         with self._lock:
-            seq = len(self._ops) + 1
-            op = {
+            seq = len(self._operacoes) + 1
+            operacao = {
                 "seq": seq,
-                "epoch": epoch,
+                "epoch": epoca,
                 "ts": round(time.time(), 6),
-                "type": op_type,
-                "data": data,
+                "type": tipo,
+                "data": dados,
             }
-            self._ops.append(op)
-            self._file.write(json.dumps(op, ensure_ascii=True, separators=(",", ":")) + "\n")
-            self._file.flush()
-            return op
+            self._operacoes.append(operacao)
+            self._arquivo.write(json.dumps(operacao, ensure_ascii=True, separators=(",", ":")) + "\n")
+            self._arquivo.flush()
+            return operacao
 
-    def record_replicated(self, op: dict) -> None:
-        """Grava no disco/memória uma operação recebida pelo seguidor."""
+    def gravar_replicada(self, operacao: dict) -> None:
         with self._lock:
-            self._ops.append(op)
-            self._file.write(json.dumps(op, ensure_ascii=True, separators=(",", ":")) + "\n")
-            self._file.flush()
+            self._operacoes.append(operacao)
+            self._arquivo.write(json.dumps(operacao, ensure_ascii=True, separators=(",", ":")) + "\n")
+            self._arquivo.flush()
 
-    def head(self) -> int:
+    def topo(self) -> int:
         with self._lock:
-            return len(self._ops)
+            return len(self._operacoes)
 
-    def get_from(self, seq: int) -> list[dict]:
+    def obter_a_partir(self, seq: int) -> list[dict]:
         with self._lock:
             if seq <= 1:
-                return list(self._ops)
-            return list(self._ops[seq - 1 :])
+                return list(self._operacoes)
+            return list(self._operacoes[seq - 1 :])
 
-    def get_at(self, seq: int) -> dict | None:
+    def obter_em(self, seq: int) -> dict | None:
         with self._lock:
-            if 1 <= seq <= len(self._ops):
-                return self._ops[seq - 1]
+            if 1 <= seq <= len(self._operacoes):
+                return self._operacoes[seq - 1]
             return None
 
-    def close(self) -> None:
+    def fechar(self) -> None:
         with self._lock:
-            if not self._file.closed:
-                self._file.close()
+            if not self._arquivo.closed:
+                self._arquivo.close()
 
 
 class Aplicador:
     """Aplica operações REPL_<json> no estado do seguidor na ordem exata de seq."""
 
-    def __init__(self, state: Estado, oplog: OpLog, logger: MetricsLogger, epoch: int = 1):
-        self.state = state
-        self.oplog = oplog
+    def __init__(self, estado: Estado, log_ops: LogOperacoes, logger: LoggerMetricas, epoca: int = 1):
+        self.estado = estado
+        self.log_ops = log_ops
         self.logger = logger
-        self.epoch = epoch
-        self.last_seq = 0
-        self.first_repl_ts: float | None = None
-        self.on_applied_event = threading.Event()
+        self.epoca = epoca
+        self.ultimo_seq = 0
+        self.primeiro_repl_ts: float | None = None
+        self.evento_aplicado = threading.Event()
         self._lock = threading.Lock()
 
-    def handle_repl(self, line: str) -> tuple[str, bool]:
-        op = parse_repl(line)
-        op_epoch = op["epoch"]
-        seq = op["seq"]
-        is_recovery = bool(op.pop("recovery", False))
+    def tratar_repl(self, linha: str) -> tuple[str, bool]:
+        operacao = interpretar_repl(linha)
+        epoca_op = operacao["epoch"]
+        seq = operacao["seq"]
+        eh_recuperacao = bool(operacao.pop("recovery", False))
 
         with self._lock:
-            if self.first_repl_ts is None:
-                self.first_repl_ts = time.monotonic()
+            if self.primeiro_repl_ts is None:
+                self.primeiro_repl_ts = time.monotonic()
 
-            if op_epoch < self.epoch:
-                return f"ERROR_STALE_EPOCH_{self.epoch}", False
+            if epoca_op < self.epoca:
+                return f"ERROR_STALE_EPOCH_{self.epoca}", False
 
-            if seq <= self.last_seq:
-                return f"ACK_REPL_{self.last_seq}", False
+            if seq <= self.ultimo_seq:
+                return f"ACK_REPL_{self.ultimo_seq}", False
 
-            if seq > self.last_seq + 1:
-                return f"ERROR_GAP_{self.last_seq}", False
+            if seq > self.ultimo_seq + 1:
+                return f"ERROR_GAP_{self.ultimo_seq}", False
 
-            if not self.state.apply_op(op):
-                raise ProtocolError("INVALID_FORMAT", f"Operação inválida: {op.get('type')}")
+            if not self.estado.aplicar_operacao(operacao):
+                raise ErroProtocolo("INVALID_FORMAT", f"Operação inválida: {operacao.get('type')}")
 
-            # Grava op limpo (sem 'recovery') para manter idêntico ao OpLog do líder
-            self.oplog.record_replicated(op)
-            self.last_seq = seq
+            self.log_ops.gravar_replicada(operacao)
+            self.ultimo_seq = seq
 
-        if not is_recovery:
-            delay = max(0.0, round(time.time() - float(op["ts"]), 6))
-            self.logger.log("atraso_replicacao", valor=delay, seq=seq, tipo=op["type"])
+        if not eh_recuperacao:
+            atraso = max(0.0, round(time.time() - float(operacao["ts"]), 6))
+            self.logger.registrar("atraso_replicacao", valor=atraso, seq=seq, tipo=operacao["type"])
 
-        self.on_applied_event.set()
+        self.evento_aplicado.set()
         return f"ACK_REPL_{seq}", False
 
-    def handle_digest(self, _line: str) -> tuple[str, bool]:
+    def tratar_digest(self, _linha: str) -> tuple[str, bool]:
         with self._lock:
-            seq = self.last_seq
-            crc = self.state.digest()
-        return fmt_digest(seq, crc), False
+            seq = self.ultimo_seq
+            crc = self.estado.resumo_crc()
+        return formatar_digest(seq, crc), False
 
 
-class ReplicaLink:
-    """Thread dedicada para enviar o OpLog continuamente a um seguidor."""
+class EloReplicacao:
+    """Thread dedicada para enviar o LogOperacoes continuamente a um seguidor."""
 
     def __init__(
         self,
-        follower_id: int,
+        id_seguidor: int,
         ip: str,
-        port: int,
-        oplog: OpLog,
-        target_sync_seq: int,
-        on_ack_cb: Callable[[int, int, str], None],
-        on_stale_epoch_cb: Callable[[int], None],
-        logger: MetricsLogger | None = None,
-        send_fn: Callable[[str, int, str], str] | None = None,
+        porta: int,
+        log_ops: LogOperacoes,
+        seq_alvo_sinc: int,
+        ao_confirmar_cb: Callable[[int, int, str], None],
+        ao_epoca_antiga_cb: Callable[[int], None],
+        logger: LoggerMetricas | None = None,
+        func_envio: Callable[[str, int, str], str] | None = None,
     ):
-        self.follower_id = follower_id
+        self.id_seguidor = id_seguidor
         self.ip = ip
-        self.port = port
-        self.oplog = oplog
-        self.target_sync_seq = target_sync_seq
-        self.on_ack_cb = on_ack_cb
-        self.on_stale_epoch_cb = on_stale_epoch_cb
+        self.porta = porta
+        self.log_ops = log_ops
+        self.seq_alvo_sinc = seq_alvo_sinc
+        self.ao_confirmar_cb = ao_confirmar_cb
+        self.ao_epoca_antiga_cb = ao_epoca_antiga_cb
         self.logger = logger
-        self.send_fn = send_fn
+        self.func_envio = func_envio
 
         self.cursor = 1
-        self.acked_seq = 0
-        self.status = "SYNCED" if target_sync_seq == 0 else "CATCHING_UP"
-        self._unexpected_logged = False
+        self.seq_confirmado = 0
+        self.situacao = "SYNCED" if seq_alvo_sinc == 0 else "CATCHING_UP"
+        self._erro_inesperado_registrado = False
 
-        self._wake = threading.Event()
-        self._stop = threading.Event()
+        self._acordar = threading.Event()
+        self._parar = threading.Event()
         self._sock: socket.socket | None = None
-        self._reader: LineReader | None = None
+        self._leitor: LeitorLinha | None = None
         self._thread = threading.Thread(
-            target=self._run, name=f"ReplicaLink-{follower_id}", daemon=True
+            target=self._executar, name=f"EloReplicacao-{id_seguidor}", daemon=True
         )
 
-    def start(self) -> None:
+    def iniciar(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
-        self._stop.set()
-        self._wake.set()
-        self._close_socket()
+    def parar(self) -> None:
+        self._parar.set()
+        self._acordar.set()
+        self._fechar_socket()
         self._thread.join(timeout=1.5)
 
-    def notify(self) -> None:
-        self._wake.set()
+    def notificar(self) -> None:
+        self._acordar.set()
 
-    def _close_socket(self) -> None:
+    def _fechar_socket(self) -> None:
         if self._sock is not None:
             try:
                 self._sock.close()
             except OSError:
                 pass
             self._sock = None
-            self._reader = None
+            self._leitor = None
 
-    def _send_wire(self, line: str) -> str:
-        if self.send_fn is not None:
-            return self.send_fn(self.ip, self.port, line)
+    def _enviar_rede(self, linha: str) -> str:
+        if self.func_envio is not None:
+            return self.func_envio(self.ip, self.porta, linha)
 
-        if self._sock is None or self._reader is None:
-            sock = socket.create_connection((self.ip, self.port), timeout=config.REPL_LINK_TIMEOUT_SEC)
+        if self._sock is None or self._leitor is None:
+            sock = socket.create_connection((self.ip, self.porta), timeout=TIMEOUT_LINK_REPL_SEG)
             self._sock = sock
-            self._reader = LineReader(sock)
+            self._leitor = LeitorLinha(sock)
 
-        send_line(self._sock, line)
-        reply = self._reader.read_line(timeout=config.REPL_LINK_TIMEOUT_SEC)
-        if reply is None:
-            self._close_socket()
-            sock = socket.create_connection((self.ip, self.port), timeout=config.REPL_LINK_TIMEOUT_SEC)
+        enviar_linha(self._sock, linha)
+        resposta = self._leitor.ler_linha(timeout=TIMEOUT_LINK_REPL_SEG)
+        if resposta is None:
+            self._fechar_socket()
+            sock = socket.create_connection((self.ip, self.porta), timeout=TIMEOUT_LINK_REPL_SEG)
             self._sock = sock
-            self._reader = LineReader(sock)
-            send_line(self._sock, line)
-            reply = self._reader.read_line(timeout=config.REPL_LINK_TIMEOUT_SEC)
-            if reply is None:
+            self._leitor = LeitorLinha(sock)
+            enviar_linha(self._sock, linha)
+            resposta = self._leitor.ler_linha(timeout=TIMEOUT_LINK_REPL_SEG)
+            if resposta is None:
                 raise ConnectionResetError("EOF após reconexão de replicação")
-        return reply
+        return resposta
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            op = self.oplog.get_at(self.cursor)
-            if op is None:
-                self._wake.wait(timeout=0.25)
-                self._wake.clear()
+    def _executar(self) -> None:
+        while not self._parar.is_set():
+            operacao = self.log_ops.obter_em(self.cursor)
+            if operacao is None:
+                self._acordar.wait(timeout=0.25)
+                self._acordar.clear()
                 continue
 
-            # Marca operações que faziam parte do backlog inicial de recuperação
-            if self.cursor <= self.target_sync_seq:
-                wire_op = {**op, "recovery": True}
+            if self.cursor <= self.seq_alvo_sinc:
+                op_envio = {**operacao, "recovery": True}
             else:
-                wire_op = op
+                op_envio = operacao
 
             try:
-                reply = self._send_wire(fmt_repl(wire_op))
+                resposta = self._enviar_rede(formatar_repl(op_envio))
             except (OSError, ValueError):
-                self._close_socket()
-                self._stop.wait(timeout=config.REPL_RECONNECT_DELAY_SEC)
+                self._fechar_socket()
+                self._parar.wait(timeout=ATRASO_RECONEXAO_REPL_SEG)
                 continue
 
-            if reply.startswith("ACK_REPL_"):
+            if resposta.startswith("ACK_REPL_"):
                 try:
-                    n = int(reply.split("_")[-1])
+                    n = int(resposta.split("_")[-1])
                 except ValueError:
                     n = -1
                 if n >= self.cursor:
-                    self._unexpected_logged = False
+                    self._erro_inesperado_registrado = False
                     self.cursor = n + 1
-                    self.acked_seq = max(self.acked_seq, n)
-                    if self.status in ("CATCHING_UP", "LAGGING") and self.acked_seq >= self.target_sync_seq:
-                        self.status = "SYNCED"
-                    self.on_ack_cb(self.follower_id, self.acked_seq, self.status)
+                    self.seq_confirmado = max(self.seq_confirmado, n)
+                    if self.situacao in ("CATCHING_UP", "LAGGING") and self.seq_confirmado >= self.seq_alvo_sinc:
+                        self.situacao = "SYNCED"
+                    self.ao_confirmar_cb(self.id_seguidor, self.seq_confirmado, self.situacao)
                     continue
 
-            if reply.startswith("ERROR_GAP_"):
-                self._unexpected_logged = False
+            if resposta.startswith("ERROR_GAP_"):
+                self._erro_inesperado_registrado = False
                 try:
-                    last = int(reply.split("_")[-1])
-                    self.cursor = max(1, last + 1)
+                    ultimo = int(resposta.split("_")[-1])
+                    self.cursor = max(1, ultimo + 1)
                 except ValueError:
                     self.cursor = 1
                 continue
 
-            if reply.startswith("ERROR_STALE_EPOCH"):
-                self.on_stale_epoch_cb(self.follower_id)
+            if resposta.startswith("ERROR_STALE_EPOCH"):
+                self.ao_epoca_antiga_cb(self.id_seguidor)
                 break
 
-            # Resposta inesperada ou ACK com n < cursor: evita loop de CPU e loga só 1 vez
-            if not self._unexpected_logged and self.logger is not None:
-                self._unexpected_logged = True
-                self.logger.log(
+            if not self._erro_inesperado_registrado and self.logger is not None:
+                self._erro_inesperado_registrado = True
+                self.logger.registrar(
                     "erro_replicacao_resposta",
                     valor=1,
-                    seguidor=self.follower_id,
+                    seguidor=self.id_seguidor,
                     cursor=self.cursor,
-                    resposta=reply[:80],
+                    resposta=resposta[:80],
                 )
-            self._stop.wait(timeout=config.REPL_RECONNECT_DELAY_SEC)
+            self._parar.wait(timeout=ATRASO_RECONEXAO_REPL_SEG)
 
 
 class Replicador:
-    """Gerencia o OpLog do líder e coordena os links para os seguidores."""
+    """Gerencia o LogOperacoes do líder e coordena os elos com os seguidores."""
 
     def __init__(
         self,
-        oplog: OpLog,
-        logger: MetricsLogger,
-        epoch: int = 1,
-        send_fn: Callable[[str, int, str], str] | None = None,
+        log_ops: LogOperacoes,
+        logger: LoggerMetricas,
+        epoca: int = 1,
+        func_envio: Callable[[str, int, str], str] | None = None,
     ):
-        self.oplog = oplog
+        self.log_ops = log_ops
         self.logger = logger
-        self.epoch = epoch
-        self.send_fn = send_fn
+        self.epoca = epoca
+        self.func_envio = func_envio
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
-        self._links: dict[int, ReplicaLink] = {}
-        self.stale_epoch_detected = False
+        self._elos: dict[int, EloReplicacao] = {}
+        self.epoca_obsoleta_detectada = False
 
-    def append_locked(self, op_type: str, data: dict) -> int:
-        op = self.oplog.append(op_type, data, epoch=self.epoch)
+    def anexar_sob_lock(self, tipo: str, dados: dict) -> int:
+        operacao = self.log_ops.anexar(tipo, dados, epoca=self.epoca)
         with self._lock:
-            links = list(self._links.values())
-        for link in links:
-            link.notify()
-        return op["seq"]
+            elos = list(self._elos.values())
+        for elo in elos:
+            elo.notificar()
+        return operacao["seq"]
 
-    def add_follower(self, server_id: int, ip: str, port: int) -> None:
+    def adicionar_seguidor(self, id_servidor: int, ip: str, porta: int) -> None:
         with self._lock:
-            old = self._links.pop(server_id, None)
-        if old is not None:
-            old.stop()
+            antigo = self._elos.pop(id_servidor, None)
+        if antigo is not None:
+            antigo.parar()
 
-        head_seq = self.oplog.head()
-        link = ReplicaLink(
-            follower_id=server_id,
+        topo_seq = self.log_ops.topo()
+        elo = EloReplicacao(
+            id_seguidor=id_servidor,
             ip=ip,
-            port=port,
-            oplog=self.oplog,
-            target_sync_seq=head_seq,
-            on_ack_cb=self._on_link_ack,
-            on_stale_epoch_cb=self._on_stale_epoch,
+            porta=porta,
+            log_ops=self.log_ops,
+            seq_alvo_sinc=topo_seq,
+            ao_confirmar_cb=self._ao_confirmar_elo,
+            ao_epoca_antiga_cb=self._ao_epoca_antiga,
             logger=self.logger,
-            send_fn=self.send_fn,
+            func_envio=self.func_envio,
         )
         with self._lock:
-            self._links[server_id] = link
-        link.start()
-        link.notify()
+            self._elos[id_servidor] = elo
+        elo.iniciar()
+        elo.notificar()
 
-    def remove_follower(self, server_id: int) -> None:
+    def remover_seguidor(self, id_servidor: int) -> None:
         with self._lock:
-            link = self._links.pop(server_id, None)
+            elo = self._elos.pop(id_servidor, None)
             self._cond.notify_all()
-        if link is not None:
-            link.stop()
+        if elo is not None:
+            elo.parar()
 
-    def _on_link_ack(self, _follower_id: int, _acked_seq: int, _status: str) -> None:
+    def _ao_confirmar_elo(self, _id_seguidor: int, _seq: int, _situacao: str) -> None:
         with self._cond:
             self._cond.notify_all()
 
-    def _on_stale_epoch(self, _follower_id: int) -> None:
+    def _ao_epoca_antiga(self, _id_seguidor: int) -> None:
         with self._cond:
-            self.stale_epoch_detected = True
+            self.epoca_obsoleta_detectada = True
             self._cond.notify_all()
 
-    def wait_replicated(self, seq: int, timeout: float = config.REPL_WAIT_SEC) -> dict:
+    def aguardar_replicacao(self, seq: int, timeout: float = ESPERA_REPLICACAO_SEG) -> dict:
         t0 = time.monotonic()
-        deadline = t0 + max(0.0, timeout)
+        prazo = t0 + max(0.0, timeout)
 
         with self._cond:
             while True:
-                synced_links = [lk for lk in self._links.values() if lk.status == "SYNCED"]
-                if not synced_links or all(lk.acked_seq >= seq for lk in synced_links):
+                sincronizados = [elo for elo in self._elos.values() if elo.situacao == "SYNCED"]
+                if not sincronizados or all(elo.seq_confirmado >= seq for elo in sincronizados):
                     break
 
-                rem = deadline - time.monotonic()
-                if rem <= 0:
-                    for lk in synced_links:
-                        if lk.acked_seq < seq:
-                            lk.status = "LAGGING"
-                            lk.target_sync_seq = max(lk.target_sync_seq, seq)
+                restante = prazo - time.monotonic()
+                if restante <= 0:
+                    for elo in sincronizados:
+                        if elo.seq_confirmado < seq:
+                            elo.situacao = "LAGGING"
+                            elo.seq_alvo_sinc = max(elo.seq_alvo_sinc, seq)
                     break
 
-                self._cond.wait(timeout=rem)
+                self._cond.wait(timeout=restante)
 
-            synced_ok = sum(
-                1 for lk in self._links.values() if lk.status == "SYNCED" and lk.acked_seq >= seq
+            qtd_sinc = sum(
+                1 for elo in self._elos.values() if elo.situacao == "SYNCED" and elo.seq_confirmado >= seq
             )
-            lagging = sum(1 for lk in self._links.values() if lk.status == "LAGGING")
+            qtd_atrasados = sum(1 for elo in self._elos.values() if elo.situacao == "LAGGING")
 
-        elapsed = round(time.monotonic() - t0, 4)
+        decorrido = round(time.monotonic() - t0, 4)
         return {
             "seq": seq,
-            "synced": synced_ok,
-            "lagging": lagging,
-            "elapsed": elapsed,
+            "sincronizados": qtd_sinc,
+            "atrasados": qtd_atrasados,
+            "decorrido": decorrido,
         }
 
-    def stop(self) -> None:
+    def parar(self) -> None:
         with self._lock:
-            links = list(self._links.values())
-            self._links.clear()
-        for lk in links:
-            lk.stop()
+            elos = list(self._elos.values())
+            self._elos.clear()
+        for elo in elos:
+            elo.parar()

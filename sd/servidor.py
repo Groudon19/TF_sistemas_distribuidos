@@ -6,134 +6,144 @@ import sys
 import threading
 import time
 
-from sd import cadastro_client, spawner
-from sd.common import config
-from sd.common.logger import MetricsLogger
-from sd.common.net import LineReader, send_and_recv, send_line
-from sd.common.protocolo import fmt_digest, fmt_error, fmt_hello, fmt_shutdown
-from sd.coordenador import Coordenador
-from sd.escalador import Escalador
+from sd.config import (
+    ATRASO_TENTATIVA_HELLO_SEG,
+    ID_SERVIDOR_INICIAL,
+    IP_BIND,
+    IP_SERVIDOR,
+    PORTA_SERVIDOR,
+    TENTATIVAS_HELLO,
+    TIMEOUT_DRENAGEM_SEG,
+    TIMEOUT_INTERNO_SEG,
+    LeitorLinha,
+    LoggerMetricas,
+    enviar_e_receber,
+    enviar_linha,
+    formatar_erro,
+    formatar_hello,
+    formatar_shutdown,
+    porta_do_servidor,
+)
+from sd.coordenador import Coordenador, Escalador
 from sd.estado import Estado
-from sd.mensagens import Receptor, Roteador
-from sd.replicacao import Aplicador, OpLog, Replicador
-from sd.usuarios import GerenciadorUsuarios
+from sd.mensagens import GerenciadorUsuarios, Receptor, Roteador
+from sd.replicacao import Aplicador, LogOperacoes, Replicador
 
-IDLE_CONN_TIMEOUT_SEC = 30.0
+TIMEOUT_CONEXAO_OCIOSA_SEG = 30.0
 
 
-class NodeTCPServer(socketserver.ThreadingTCPServer):
+class ServidorTCPNo(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
     request_queue_size = 128
 
     def __init__(
         self,
-        server_address: tuple[str, int],
-        handler_cls,
-        coordinator: Coordenador,
-        logger: MetricsLogger,
-        shutdown_event: threading.Event,
+        endereco_servidor: tuple[str, int],
+        classe_handler,
+        coordenador: Coordenador,
+        logger: LoggerMetricas,
+        evento_encerrar: threading.Event,
     ):
-        super().__init__(server_address, handler_cls)
-        self.coordinator = coordinator
+        super().__init__(endereco_servidor, classe_handler)
+        self.coordenador = coordenador
         self.logger = logger
-        self.shutdown_event = shutdown_event
+        self.evento_encerrar = evento_encerrar
 
 
-class ClientConnectionHandler(socketserver.BaseRequestHandler):
+class TratadorConexaoCliente(socketserver.BaseRequestHandler):
     def handle(self) -> None:
-        srv: NodeTCPServer = self.server  # type: ignore[assignment]
-        peer = f"{self.client_address[0]}:{self.client_address[1]}"
-        reader = LineReader(self.request)
+        srv: ServidorTCPNo = self.server  # type: ignore[assignment]
+        origem = f"{self.client_address[0]}:{self.client_address[1]}"
+        leitor = LeitorLinha(self.request)
 
-        while not srv.shutdown_event.is_set():
+        while not srv.evento_encerrar.is_set():
             try:
-                line = reader.read_line(timeout=IDLE_CONN_TIMEOUT_SEC)
+                linha = leitor.ler_linha(timeout=TIMEOUT_CONEXAO_OCIOSA_SEG)
             except ValueError:
-                srv.logger.log("erro_rede", valor=1, origem=peer, motivo="LINE_TOO_LONG")
+                srv.logger.registrar("erro_rede", valor=1, origem=origem, motivo="LINE_TOO_LONG")
                 try:
-                    send_line(self.request, fmt_error("LINE_TOO_LONG"))
+                    enviar_linha(self.request, formatar_erro("LINE_TOO_LONG"))
                 except OSError:
                     pass
                 break
             except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError) as exc:
-                srv.logger.log("conexao_encerrada", valor=1, origem=peer, motivo=type(exc).__name__)
+                srv.logger.registrar("conexao_encerrada", valor=1, origem=origem, motivo=type(exc).__name__)
                 break
 
-            if line is None:
+            if linha is None:
                 break
 
-            if not line.strip():
+            if not linha.strip():
                 continue
 
             try:
-                reply, should_shutdown = srv.coordinator.handle_line(line)
+                resposta, deve_encerrar = srv.coordenador.tratar_linha(linha)
             except ConnectionResetError:
-                # Usado por CHAOS_DROP_ACK_PROB para simular queda de ACK após processamento
                 break
 
             try:
-                send_line(self.request, reply)
+                enviar_linha(self.request, resposta)
             except UnicodeEncodeError:
-                srv.logger.log("erro_rede", valor=1, origem=peer, motivo="ENCODING")
+                srv.logger.registrar("erro_rede", valor=1, origem=origem, motivo="ENCODING")
                 try:
-                    send_line(self.request, fmt_error("ENCODING"))
+                    enviar_linha(self.request, formatar_erro("ENCODING"))
                 except OSError:
                     pass
                 break
             except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError) as exc:
-                srv.logger.log("conexao_encerrada", valor=1, origem=peer, motivo=type(exc).__name__)
+                srv.logger.registrar("conexao_encerrada", valor=1, origem=origem, motivo=type(exc).__name__)
                 break
 
-            if should_shutdown:
-                srv.logger.log("servidor_encerrando", valor=1, motivo="COMANDO")
-                srv.shutdown_event.set()
+            if deve_encerrar:
+                srv.logger.registrar("servidor_encerrando", valor=1, motivo="COMANDO")
+                srv.evento_encerrar.set()
                 break
 
 
-def _send_shutdown_cmd(ip: str, port: int, server_id: int) -> bool:
-    reply = send_and_recv(ip, port, fmt_shutdown(server_id), timeout=config.INTERNAL_TIMEOUT_SEC)
-    return reply == f"ACK_SHUTDOWN_{server_id}"
+def _enviar_comando_shutdown(ip: str, porta: int, id_servidor: int) -> bool:
+    resposta = enviar_e_receber(ip, porta, formatar_shutdown(id_servidor), timeout=TIMEOUT_INTERNO_SEG)
+    return resposta == f"ACK_SHUTDOWN_{id_servidor}"
 
 
-def _announce_hello(
-    node_id: int,
-    coord_ip: str,
-    coord_port: int,
-    boot_ts: float,
-    logger: MetricsLogger,
-    shutdown_event: threading.Event,
+def _anunciar_hello(
+    id_no: int,
+    ip_coord: str,
+    porta_coord: int,
+    ts_inicio: float,
+    logger: LoggerMetricas,
+    evento_encerrar: threading.Event,
 ) -> None:
-    expected = f"ACK_HELLO_{node_id}"
-    msg = fmt_hello(node_id)
+    esperado = f"ACK_HELLO_{id_no}"
+    mensagem = formatar_hello(id_no)
 
-    for attempt in range(1, config.HELLO_RETRIES + 1):
-        if shutdown_event.is_set():
+    for tentativa in range(1, TENTATIVAS_HELLO + 1):
+        if evento_encerrar.is_set():
             return
         try:
-            reply = send_and_recv(coord_ip, coord_port, msg, timeout=config.INTERNAL_TIMEOUT_SEC)
-            if reply == expected:
-                elapsed = round(time.monotonic() - boot_ts, 4)
-                logger.log("hello_confirmado", valor=elapsed, tentativas=attempt)
+            resposta = enviar_e_receber(ip_coord, porta_coord, mensagem, timeout=TIMEOUT_INTERNO_SEG)
+            if resposta == esperado:
+                decorrido = round(time.monotonic() - ts_inicio, 4)
+                logger.registrar("hello_confirmado", valor=decorrido, tentativas=tentativa)
                 return
-            if reply == "ERROR_UNKNOWN_SERVER":
-                shutdown_event.set()
+            if resposta == "ERROR_UNKNOWN_SERVER":
+                evento_encerrar.set()
                 return
         except OSError:
             pass
 
-        if attempt < config.HELLO_RETRIES:
-            time.sleep(config.HELLO_RETRY_DELAY)
+        if tentativa < TENTATIVAS_HELLO:
+            time.sleep(ATRASO_TENTATIVA_HELLO_SEG)
 
-    logger.log("hello_falhou", valor=config.HELLO_RETRIES)
-    shutdown_event.set()
+    logger.registrar("hello_falhou", valor=TENTATIVAS_HELLO)
+    evento_encerrar.set()
 
 
-def parse_args() -> argparse.Namespace:
+def ler_argumentos() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Servidor do Sistema Distribuído")
     parser.add_argument("--id", type=int, required=True, help="Identificador inteiro >= 0 do servidor")
-    parser.add_argument("--coord-ip", default=config.SERVER_IP, help="IP do coordenador atual")
-    parser.add_argument("--coord-port", type=int, default=config.SERVER_PORT, help="Porta do coordenador atual")
+    parser.add_argument("--coord-ip", default=IP_SERVIDOR, help="IP do coordenador atual")
+    parser.add_argument("--coord-port", type=int, default=PORTA_SERVIDOR, help="Porta do coordenador atual")
     args = parser.parse_args()
     if args.id < 0:
         parser.error("--id deve ser >= 0")
@@ -141,114 +151,106 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    boot_ts = time.monotonic()
-    args = parse_args()
-    node_id: int = args.id
-    port = config.port_for_server(node_id)
-    is_coord = node_id == config.INITIAL_SERVER_ID
+    ts_inicio = time.monotonic()
+    args = ler_argumentos()
+    id_no: int = args.id
+    porta = porta_do_servidor(id_no)
+    eh_coord = id_no == ID_SERVIDOR_INICIAL
 
-    logger = MetricsLogger("coordenador" if is_coord else "servidor", node_id)
-    state = Estado(my_id=node_id, is_coordinator=is_coord)
-    state.coordinator_addr = (args.coord_ip, args.coord_port)
+    logger = LoggerMetricas("coordenador" if eh_coord else "servidor", id_no)
+    estado = Estado(meu_id=id_no, eh_coordenador=eh_coord)
+    estado.endereco_coordenador = (args.coord_ip, args.coord_port)
 
-    coordinator = Coordenador(state=state, logger=logger)
-    shutdown_event = threading.Event()
+    coordenador = Coordenador(estado=estado, logger=logger)
+    evento_encerrar = threading.Event()
 
-    oplog = OpLog(node_id=node_id)
+    log_ops = LogOperacoes(id_no=id_no)
     escalador: Escalador | None = None
     replicador: Replicador | None = None
     aplicador: Aplicador | None = None
 
-    receptor = Receptor(state=state, logger=logger)
-    coordinator.register_handler("DELIVER", receptor.handle_deliver)
+    receptor = Receptor(estado=estado, logger=logger)
+    coordenador.registrar_tratador("DELIVER", receptor.tratar_deliver)
 
-    if is_coord:
-        state.register_server(node_id, ip=config.SERVER_IP, port=port)
-        replicador = Replicador(oplog=oplog, logger=logger)
-        coordinator.attach_replicator(replicador)
-        replicador.append_locked("SRV_UP", {"id": node_id, "ip": config.SERVER_IP, "port": port})
+    if eh_coord:
+        estado.registrar_servidor(id_no, ip=IP_SERVIDOR, porta=porta)
+        replicador = Replicador(log_ops=log_ops, logger=logger)
+        coordenador.anexar_replicador(replicador)
+        replicador.anexar_sob_lock("SRV_UP", {"id": id_no, "ip": IP_SERVIDOR, "port": porta})
 
-        roteador = Roteador(coordenador=coordinator, logger=logger)
-        coordinator.register_handler("MSG", roteador.handle_msg)
-        coordinator.register_handler("DIGEST", coordinator.handle_digest)
-        
-        coordinator.attach_scaler(escalador)
-        wake_evt = coordinator.on_state_change_event
+        roteador = Roteador(coordenador=coordenador, logger=logger)
+        coordenador.registrar_tratador("MSG", roteador.tratar_msg)
+        coordenador.registrar_tratador("DIGEST", coordenador.tratar_digest)
 
         escalador = Escalador(
-            coordenador=coordinator,
+            coordenador=coordenador,
             logger=logger,
-            spawn_fn=spawner.spawn_server,
-            newid_fn=cadastro_client.send_newid,
-            shutdown_fn=_send_shutdown_cmd,
-            terminate_fn=spawner.terminate_process,
+            func_shutdown=_enviar_comando_shutdown,
         )
-        coordinator.attach_scaler(escalador)
-        wake_evt = threading.Event()
+        coordenador.anexar_escalador(escalador)
+        evento_acordar = coordenador.evento_mudanca_estado
     else:
-        # Seguidor não se auto-registra; recebe o estado via REPL
-        aplicador = Aplicador(state=state, oplog=oplog, logger=logger)
-        coordinator.register_handler("REPL", aplicador.handle_repl)
-        coordinator.register_handler("DIGEST", aplicador.handle_digest)
-        wake_evt = aplicador.on_applied_event
+        aplicador = Aplicador(estado=estado, log_ops=log_ops, logger=logger)
+        coordenador.registrar_tratador("REPL", aplicador.tratar_repl)
+        coordenador.registrar_tratador("DIGEST", aplicador.tratar_digest)
+        evento_acordar = aplicador.evento_aplicado
 
-    gerenciador_usuarios = GerenciadorUsuarios(state=state, logger=logger, wake_event=wake_evt)
+    gerenciador_usuarios = GerenciadorUsuarios(estado=estado, logger=logger, evento_acordar=evento_acordar)
 
-    def _signal_handler(signum, _frame):
-        logger.log("sinal_recebido", valor=signum)
-        shutdown_event.set()
+    def _tratar_sinal(signum, _frame):
+        logger.registrar("sinal_recebido", valor=signum)
+        evento_encerrar.set()
 
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _tratar_sinal)
+    signal.signal(signal.SIGTERM, _tratar_sinal)
 
     try:
-        tcp_server = NodeTCPServer(
-            (config.BIND_IP, port),
-            ClientConnectionHandler,
-            coordinator=coordinator,
+        servidor_tcp = ServidorTCPNo(
+            (IP_BIND, porta),
+            TratadorConexaoCliente,
+            coordenador=coordenador,
             logger=logger,
-            shutdown_event=shutdown_event,
+            evento_encerrar=evento_encerrar,
         )
     except OSError as exc:
-        sys.exit(f"Erro ao abrir socket em {config.BIND_IP}:{port}: {exc}")
+        sys.exit(f"Erro ao abrir socket em {IP_BIND}:{porta}: {exc}")
 
-    server_thread = threading.Thread(
-        target=lambda: tcp_server.serve_forever(poll_interval=0.1),
+    thread_servidor = threading.Thread(
+        target=lambda: servidor_tcp.serve_forever(poll_interval=0.1),
         daemon=True,
     )
-    server_thread.start()
+    thread_servidor.start()
 
-    role = "COORDENADOR" if is_coord else "SERVIDOR"
-    print(f"[ok] Servidor {node_id} ({role}) escutando em {config.BIND_IP}:{port}")
-    logger.log("servidor_iniciado", valor=1, porta=port, papel=role)
+    papel = "COORDENADOR" if eh_coord else "SERVIDOR"
+    print(f"[ok] Servidor {id_no} ({papel}) escutando em {IP_BIND}:{porta}")
+    logger.registrar("servidor_iniciado", valor=1, porta=porta, papel=papel)
 
-    gerenciador_usuarios.start()
+    gerenciador_usuarios.iniciar()
     if escalador is not None:
-        escalador.start()
+        escalador.iniciar()
     else:
         threading.Thread(
-            target=_announce_hello,
-            args=(node_id, args.coord_ip, args.coord_port, boot_ts, logger, shutdown_event),
+            target=_anunciar_hello,
+            args=(id_no, args.coord_ip, args.coord_port, ts_inicio, logger, evento_encerrar),
             daemon=True,
         ).start()
 
     try:
-        while not shutdown_event.is_set():
-            shutdown_event.wait(timeout=0.5)
+        while not evento_encerrar.is_set():
+            evento_encerrar.wait(timeout=0.5)
     finally:
-        # Ordem obrigatória de drenagem antes de fechar o socket TCP
-        gerenciador_usuarios.stop(drain=True, timeout=config.DRAIN_TIMEOUT_SEC)
-        receptor.wait_idle(timeout=config.DRAIN_TIMEOUT_SEC)
+        gerenciador_usuarios.parar(drenar=True, timeout=TIMEOUT_DRENAGEM_SEG)
+        receptor.aguardar_ocioso(timeout=TIMEOUT_DRENAGEM_SEG)
         if escalador is not None:
-            escalador.stop()
+            escalador.parar()
         if replicador is not None:
-            replicador.stop()
-        tcp_server.shutdown()
-        tcp_server.server_close()
-        receptor.close()
-        oplog.close()
-        logger.log("servidor_finalizado", valor=1)
-        print(f"[ok] Servidor {node_id} encerrado.")
+            replicador.parar()
+        servidor_tcp.shutdown()
+        servidor_tcp.server_close()
+        receptor.fechar()
+        log_ops.fechar()
+        logger.registrar("servidor_finalizado", valor=1)
+        print(f"[ok] Servidor {id_no} encerrado.")
 
     sys.exit(0)
 

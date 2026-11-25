@@ -1,369 +1,399 @@
 import json
-import zlib
+import statistics
 import threading
 import time
-from sd.common.config import MAX_USERS_PER_SERVER, SERVER_IP, SERVER_PORT
+import zlib
 
+from sd.config import IP_SERVIDOR, MAX_USUARIOS_POR_SERVIDOR, PORTA_SERVIDOR
+
+
+# =====================================================================
+# Funções Auxiliares de Alocação e Balanceamento
+# =====================================================================
+
+def escolher_servidor_para_usuario(cargas: dict[int, int], capacidade: int) -> int | None:
+    """Escolhe o servidor ativo com menor carga (< capacidade); empate -> menor ID."""
+    candidatos = [(carga, sid) for sid, carga in cargas.items() if carga < capacidade]
+    if not candidatos:
+        return None
+    _, escolhido = min(candidatos)
+    return escolhido
+
+
+def realocar_orfaos(
+    orfaos: list[int], cargas: dict[int, int], capacidade: int
+) -> tuple[dict[int, int], list[int]]:
+    """Redistribui usuários órfãos entre servidores ativos respeitando a capacidade."""
+    cargas_temp = dict(cargas)
+    atribuicoes: dict[int, int] = {}
+    pendentes: list[int] = []
+
+    for id_usuario in sorted(orfaos):
+        destino = escolher_servidor_para_usuario(cargas_temp, capacidade)
+        if destino is None:
+            pendentes.append(id_usuario)
+        else:
+            atribuicoes[id_usuario] = destino
+            cargas_temp[destino] += 1
+
+    return atribuicoes, pendentes
+
+
+def calcular_metricas_balanceamento(cargas: dict[int, int]) -> dict:
+    if not cargas:
+        return {
+            "desbalanceamento": 0,
+            "desvio_padrao": 0.0,
+            "servidores": 0,
+            "usuarios": 0,
+        }
+    valores = list(cargas.values())
+    return {
+        "desbalanceamento": max(valores) - min(valores),
+        "desvio_padrao": round(statistics.pstdev(valores), 4),
+        "servidores": len(valores),
+        "usuarios": sum(valores),
+    }
+
+
+def servidores_necessarios(total_usuarios: int, capacidade: int) -> int:
+    if total_usuarios <= 0 or capacidade <= 0:
+        return 0
+    return -(-total_usuarios // capacidade)
+
+
+def servidores_desejados(total_usuarios: int, aguardando: int, capacidade: int) -> int:
+    if capacidade <= 0:
+        return 1
+    return max(1, (total_usuarios + aguardando) // capacidade + 1)
+
+
+def servidores_a_criar(desejado: int, atual: int, max_servidores: int) -> int:
+    return max(0, min(desejado, max_servidores) - atual)
+
+
+def escolher_servidor_ocioso(ocioso_desde: dict[int, float], agora: float, carencia: float) -> int | None:
+    elegiveis = [sid for sid, desde in ocioso_desde.items() if (agora - desde) >= carencia]
+    return max(elegiveis) if elegiveis else None
+
+
+# =====================================================================
+# Estado Replicado do Nó
+# =====================================================================
 
 class Estado:
-    """Estado em memória de um nó do SD, protegido por RLock."""
+    """Mantém o estado em memória de um nó (servidores, usuários e mensagens confirmadas)."""
 
-    def __init__(self, my_id: int, is_coordinator: bool = False, capacity: int = MAX_USERS_PER_SERVER):
+    def __init__(self, meu_id: int, eh_coordenador: bool = False, capacidade: int = MAX_USUARIOS_POR_SERVIDOR):
         self.lock = threading.RLock()
-        self.my_id = my_id
-        self.is_coordinator = is_coordinator
-        self.capacity = capacity
-        self.servers: dict[int, dict] = {}
-        self.user_server: dict[int, int | None] = {}
-        self.user_names: dict[int, str | None] = {}
-        self.processed: dict[tuple[int, int], int] = {}
-        self._coordinator_addr: tuple[str, int] = (SERVER_IP, SERVER_PORT)
+        self.meu_id = meu_id
+        self.eh_coordenador = eh_coordenador
+        self.capacidade = capacidade
+        self.servidores: dict[int, dict] = {}
+        self.usuario_servidor: dict[int, int | None] = {}
+        self.nomes_usuarios: dict[int, str | None] = {}
+        self.processadas: dict[tuple[int, int], int] = {}
+        self._endereco_coordenador: tuple[str, int] = (IP_SERVIDOR, PORTA_SERVIDOR)
 
-    def register_server(self, server_id: int, ip: str | None = None, port: int | None = None) -> None:
+    @property
+    def endereco_coordenador(self) -> tuple[str, int]:
         with self.lock:
-            entry = self.servers.get(server_id, {})
-            entry["alive"] = True
-            entry["starting"] = False
-            entry["reserved_at"] = None
+            return self._endereco_coordenador
+
+    @endereco_coordenador.setter
+    def endereco_coordenador(self, endereco: tuple[str, int]) -> None:
+        with self.lock:
+            self._endereco_coordenador = endereco
+
+    def registrar_servidor(self, id_servidor: int, ip: str | None = None, porta: int | None = None) -> None:
+        with self.lock:
+            registro = self.servidores.get(id_servidor, {})
+            registro["ativo"] = True
+            registro["iniciando"] = False
+            registro["reservado_em"] = None
             if ip is not None:
-                entry["ip"] = ip
-            if port is not None:
-                entry["port"] = port
-            self.servers[server_id] = entry
+                registro["ip"] = ip
+            if porta is not None:
+                registro["porta"] = porta
+            self.servidores[id_servidor] = registro
 
-    def reserve_server(self, ip: str, port_of) -> int:
-        """
-        Reserva atomicamente o próximo ID disponível (max + 1 ou 0),
-        registra como starting e grava reserved_at.
-        """
+    def reservar_servidor(self, ip: str, obter_porta) -> int:
         with self.lock:
-            next_id = max(self.servers.keys(), default=-1) + 1
-            port = port_of(next_id)  # pode levantar ValueError se > 65535
-            self.servers[next_id] = {
-                "alive": False,
-                "starting": True,
+            proximo_id = max(self.servidores.keys(), default=-1) + 1
+            porta = obter_porta(proximo_id)
+            self.servidores[proximo_id] = {
+                "ativo": False,
+                "iniciando": True,
                 "ip": ip,
-                "port": port,
-                "reserved_at": time.monotonic(),
+                "porta": porta,
+                "reservado_em": time.monotonic(),
             }
-            return next_id
+            return proximo_id
 
-    def is_starting(self, server_id: int) -> bool:
+    def esta_iniciando(self, id_servidor: int) -> bool:
         with self.lock:
-            info = self.servers.get(server_id)
-            return bool(info and info.get("starting"))
+            info = self.servidores.get(id_servidor)
+            return bool(info and info.get("iniciando"))
 
-    def starting_server_ids(self) -> list[int]:
+    def ids_servidores_iniciando(self) -> list[int]:
         with self.lock:
-            return sorted(sid for sid, info in self.servers.items() if info.get("starting"))
+            return sorted(sid for sid, info in self.servidores.items() if info.get("iniciando"))
 
-    def reserved_at(self, server_id: int) -> float | None:
+    def instante_reserva(self, id_servidor: int) -> float | None:
         with self.lock:
-            info = self.servers.get(server_id)
-            return info.get("reserved_at") if info else None
+            info = self.servidores.get(id_servidor)
+            return info.get("reservado_em") if info else None
 
-    def mark_active(self, server_id: int) -> str:
-        """
-        Transiciona STARTING -> ACTIVE.
-        Retorna: 'ACTIVATED' | 'ALREADY_ACTIVE' | 'UNKNOWN' | 'DEAD'.
-        """
+    def marcar_ativo(self, id_servidor: int) -> str:
         with self.lock:
-            info = self.servers.get(server_id)
+            info = self.servidores.get(id_servidor)
             if info is None:
                 return "UNKNOWN"
-            if info.get("alive"):
+            if info.get("ativo"):
                 return "ALREADY_ACTIVE"
-            if info.get("starting"):
-                info["alive"] = True
-                info["starting"] = False
+            if info.get("iniciando"):
+                info["ativo"] = True
+                info["iniciando"] = False
                 return "ACTIVATED"
             return "DEAD"
 
-    def abort_starting(self, server_id: int) -> bool:
-        """Transiciona STARTING -> DEAD. Retorna True se estava starting."""
+    def abortar_inicializacao(self, id_servidor: int) -> bool:
         with self.lock:
-            info = self.servers.get(server_id)
-            if info and info.get("starting"):
-                info["starting"] = False
-                info["alive"] = False
+            info = self.servidores.get(id_servidor)
+            if info and info.get("iniciando"):
+                info["iniciando"] = False
+                info["ativo"] = False
                 return True
             return False
 
-    def alive_server_ids(self) -> list[int]:
+    def ids_servidores_ativos(self) -> list[int]:
         with self.lock:
-            return sorted(sid for sid, info in self.servers.items() if info.get("alive"))
+            return sorted(sid for sid, info in self.servidores.items() if info.get("ativo"))
 
-    def is_known_server(self, server_id: int) -> bool:
+    def servidor_conhecido(self, id_servidor: int) -> bool:
         with self.lock:
-            return server_id in self.servers
+            return id_servidor in self.servidores
 
-    def is_alive(self, server_id: int) -> bool:
+    def servidor_ativo(self, id_servidor: int) -> bool:
         with self.lock:
-            info = self.servers.get(server_id)
-            return bool(info and info.get("alive"))
+            info = self.servidores.get(id_servidor)
+            return bool(info and info.get("ativo"))
 
-    def address_of(self, server_id: int) -> tuple[str, int] | None:
+    def endereco_de(self, id_servidor: int) -> tuple[str, int] | None:
         with self.lock:
-            info = self.servers.get(server_id)
-            if not info or "ip" not in info or "port" not in info:
+            info = self.servidores.get(id_servidor)
+            if not info or "ip" not in info or "porta" not in info:
                 return None
-            return info["ip"], info["port"]
+            return info["ip"], info["porta"]
 
-    def has_user(self, user_id: int) -> bool:
+    def possui_usuario(self, id_usuario: int) -> bool:
         with self.lock:
-            return user_id in self.user_server
+            return id_usuario in self.usuario_servidor
 
-    def server_of(self, user_id: int) -> int | None:
+    def servidor_de(self, id_usuario: int) -> int | None:
         with self.lock:
-            return self.user_server.get(user_id)
+            return self.usuario_servidor.get(id_usuario)
 
-    def users_of(self, server_id: int) -> list[int]:
+    def usuarios_do_servidor(self, id_servidor: int) -> list[int]:
         with self.lock:
-            return [uid for uid, sid in self.user_server.items() if sid == server_id]
+            return [uid for uid, sid in self.usuario_servidor.items() if sid == id_servidor]
 
-    def load_of(self, server_id: int) -> int:
+    def todos_ids_usuarios(self) -> list[int]:
         with self.lock:
-            return sum(1 for sid in self.user_server.values() if sid == server_id)
+            return sorted(self.usuario_servidor.keys())
 
-    def loads(self) -> dict[int, int]:
-        """Retorna {server_id: carga} apenas dos servidores ativos."""
+    def carga_de(self, id_servidor: int) -> int:
         with self.lock:
-            active_loads = {sid: 0 for sid, info in self.servers.items() if info.get("alive")}
-            for sid in self.user_server.values():
-                if sid is not None and sid in active_loads:
-                    active_loads[sid] += 1
-            return active_loads
+            return sum(1 for sid in self.usuario_servidor.values() if sid == id_servidor)
 
-    def free_slots(self) -> int:
+    def cargas(self) -> dict[int, int]:
         with self.lock:
-            return sum(self.capacity - load for load in self.loads().values())
+            cargas_ativas = {sid: 0 for sid, info in self.servidores.items() if info.get("ativo")}
+            for sid in self.usuario_servidor.values():
+                if sid is not None and sid in cargas_ativas:
+                    cargas_ativas[sid] += 1
+            return cargas_ativas
 
-    def idle_server_ids(self) -> list[int]:
-        """Retorna IDs ordenados de servidores ativos com carga 0, excluindo my_id."""
+    def ids_servidores_ociosos(self) -> list[int]:
         with self.lock:
-            active_loads = self.loads()
             return sorted(
-                sid for sid, load in active_loads.items() if sid != self.my_id and load == 0
+                sid for sid, carga in self.cargas().items() if sid != self.meu_id and carga == 0
             )
 
-    def retire_if_idle(self, server_id: int) -> bool:
-        """Marca como morto atomicamente apenas se ativo, != my_id e carga == 0."""
+    def desativar_se_ocioso(self, id_servidor: int) -> bool:
         with self.lock:
-            if server_id == self.my_id:
+            if id_servidor == self.meu_id:
                 return False
-            info = self.servers.get(server_id)
-            if not info or not info.get("alive"):
+            info = self.servidores.get(id_servidor)
+            if not info or not info.get("ativo") or self.carga_de(id_servidor) > 0:
                 return False
-            if self.load_of(server_id) > 0:
-                return False
-            info["alive"] = False
-            info["starting"] = False
+            info["ativo"] = False
+            info["iniciando"] = False
             return True
 
-    def total_users(self) -> int:
+    def total_usuarios(self) -> int:
         with self.lock:
-            return len(self.user_server)
+            return len(self.usuario_servidor)
 
-    def unassigned_users(self) -> list[int]:
+    def usuarios_sem_servidor(self) -> list[int]:
         with self.lock:
-            return sorted(uid for uid, sid in self.user_server.items() if sid is None)
+            return sorted(uid for uid, sid in self.usuario_servidor.items() if sid is None)
 
-    def add_user(self, user_id: int, name: str | None, server_id: int) -> str:
+    def adicionar_usuario(self, id_usuario: int, nome: str | None, id_servidor: int) -> str:
         with self.lock:
-            if user_id in self.user_server:
+            if id_usuario in self.usuario_servidor:
                 return "DUPLICATE"
-
-            srv = self.servers.get(server_id)
-            if not srv or not srv.get("alive"):
+            srv = self.servidores.get(id_servidor)
+            if not srv or not srv.get("ativo"):
                 return "NO_SERVER"
-
-            if self.load_of(server_id) >= self.capacity:
+            if self.carga_de(id_servidor) >= self.capacidade:
                 return "FULL"
-
-            self.user_server[user_id] = server_id
-            self.user_names[user_id] = name
+            self.usuario_servidor[id_usuario] = id_servidor
+            self.nomes_usuarios[id_usuario] = nome
             return "ADDED"
 
-    def fail_server(self, server_id: int) -> list[int] | None:
+    def derrubar_servidor(self, id_servidor: int) -> list[int] | None:
         with self.lock:
-            srv = self.servers.get(server_id)
-            if not srv or not srv.get("alive"):
+            srv = self.servidores.get(id_servidor)
+            if not srv or not srv.get("ativo"):
                 return None
+            srv["ativo"] = False
+            srv["iniciando"] = False
+            orfaos = sorted(uid for uid, sid in self.usuario_servidor.items() if sid == id_servidor)
+            for uid in orfaos:
+                self.usuario_servidor[uid] = None
+            return orfaos
 
-            srv["alive"] = False
-            srv["starting"] = False
-            orphans = sorted(uid for uid, sid in self.user_server.items() if sid == server_id)
-            for uid in orphans:
-                self.user_server[uid] = None
-            return orphans
-
-    def apply_assignments(self, assignments: dict[int, int]) -> list[int]:
+    def aplicar_atribuicoes(self, atribuicoes: dict[int, int]) -> list[int]:
         with self.lock:
-            rejected: list[int] = []
-            current_loads = self.loads()
-
-            for uid in sorted(assignments):
-                sid = assignments[uid]
-                if sid not in current_loads or current_loads[sid] >= self.capacity:
-                    rejected.append(uid)
+            rejeitados: list[int] = []
+            cargas_atuais = self.cargas()
+            for uid in sorted(atribuicoes):
+                sid = atribuicoes[uid]
+                if sid not in cargas_atuais or cargas_atuais[sid] >= self.capacidade:
+                    rejeitados.append(uid)
                     continue
-                if uid in self.user_server:
-                    self.user_server[uid] = sid
-                    current_loads[sid] += 1
+                if uid in self.usuario_servidor:
+                    self.usuario_servidor[uid] = sid
+                    cargas_atuais[sid] += 1
                 else:
-                    rejected.append(uid)
+                    rejeitados.append(uid)
+            return rejeitados
 
-            return rejected
+    def ja_processada(self, chave: tuple[int, int]) -> bool:
+        with self.lock:
+            return chave in self.processadas
 
-    def snapshot(self) -> dict:
-        """Retorna cópia rasa dos dicionários (omitindo reserved_at local)."""
+    def marcar_processada(self, chave: tuple[int, int], destinatario: int) -> bool:
         with self.lock:
-            servers_copy = {}
-            for sid, info in self.servers.items():
-                entry = {k: v for k, v in info.items() if k != "reserved_at"}
-                servers_copy[sid] = entry
-            return {
-                "my_id": self.my_id,
-                "is_coordinator": self.is_coordinator,
-                "capacity": self.capacity,
-                "servers": servers_copy,
-                "user_server": dict(self.user_server),
-                "user_names": dict(self.user_names),
-            }
-            
-    @property
-    def coordinator_addr(self) -> tuple[str, int]:
-        with self.lock:
-            return self._coordinator_addr
-
-    @coordinator_addr.setter
-    def coordinator_addr(self, addr: tuple[str, int]) -> None:
-        with self.lock:
-            self._coordinator_addr = addr
-
-    def all_user_ids(self) -> list[int]:
-        with self.lock:
-            return sorted(self.user_server.keys())
-
-    def is_processed(self, key: tuple[int, int]) -> bool:
-        with self.lock:
-            return key in self.processed
-
-    def mark_processed(self, key: tuple[int, int], dest: int) -> bool:
-        """Registra atomicamente (sender, msg_id) -> dest. Retorna True só na 1ª inserção."""
-        with self.lock:
-            if key in self.processed:
+            if chave in self.processadas:
                 return False
-            self.processed[key] = dest
+            self.processadas[chave] = destinatario
             return True
 
-    def apply_op(self, op: dict) -> bool:
-        """
-        Aplica de forma idempotente uma decisão replicada ao estado local.
-        Não verifica capacidade (a decisão já foi tomada pelo líder).
-        """
-        op_type = op.get("type")
-        data = op.get("data", {})
+    def aplicar_operacao(self, operacao: dict) -> bool:
+        """Aplica de forma idempotente uma decisão replicada no log."""
+        tipo = operacao.get("type")
+        dados = operacao.get("data", {})
 
         with self.lock:
-            if op_type == "SRV_UP":
-                sid = int(data["id"])
-                entry = self.servers.get(sid, {})
-                entry["alive"] = True
-                entry["starting"] = False
-                entry["reserved_at"] = None
-                if "ip" in data and data["ip"] is not None:
-                    entry["ip"] = data["ip"]
-                if "port" in data and data["port"] is not None:
-                    entry["port"] = int(data["port"])
-                self.servers[sid] = entry
+            if tipo == "SRV_UP":
+                sid = int(dados["id"])
+                reg = self.servidores.get(sid, {})
+                reg["ativo"] = True
+                reg["iniciando"] = False
+                reg["reservado_em"] = None
+                if dados.get("ip") is not None:
+                    reg["ip"] = dados["ip"]
+                if dados.get("port") is not None:
+                    reg["port"] = int(dados["port"])
+                self.servidores[sid] = reg
                 return True
 
-            if op_type == "SRV_RESERVED":
-                sid = int(data["id"])
-                entry = self.servers.get(sid, {})
-                # Só define STARTING se o servidor ainda não avançou para ACTIVE ou DEAD
-                if not entry.get("alive") and "alive" not in entry:
-                    entry["alive"] = False
-                    entry["starting"] = True
-                    entry["reserved_at"] = None
-                if "ip" in data and data["ip"] is not None:
-                    entry["ip"] = data["ip"]
-                if "port" in data and data["port"] is not None:
-                    entry["port"] = int(data["port"])
-                self.servers[sid] = entry
+            if tipo == "SRV_RESERVED":
+                sid = int(dados["id"])
+                reg = self.servidores.get(sid, {})
+                if not reg.get("ativo") and "ativo" not in reg:
+                    reg["ativo"] = False
+                    reg["iniciando"] = True
+                    reg["reservado_em"] = None
+                if dados.get("ip") is not None:
+                    reg["ip"] = dados["ip"]
+                if dados.get("port") is not None:
+                    reg["port"] = int(dados["port"])
+                self.servidores[sid] = reg
                 return True
 
-            if op_type == "SRV_ACTIVE":
-                sid = int(data["id"])
-                entry = self.servers.get(sid, {})
-                entry["alive"] = True
-                entry["starting"] = False
-                entry["reserved_at"] = None
-                if "ip" in data and data["ip"] is not None:
-                    entry["ip"] = data["ip"]
-                if "port" in data and data["port"] is not None:
-                    entry["port"] = int(data["port"])
-                self.servers[sid] = entry
+            if tipo == "SRV_ACTIVE":
+                sid = int(dados["id"])
+                reg = self.servidores.get(sid, {})
+                reg["ativo"] = True
+                reg["iniciando"] = False
+                reg["reservado_em"] = None
+                if dados.get("ip") is not None:
+                    reg["ip"] = dados["ip"]
+                if dados.get("port") is not None:
+                    reg["port"] = int(dados["port"])
+                self.servidores[sid] = reg
                 return True
 
-            if op_type == "SRV_DEAD":
-                sid = int(data["id"])
-                entry = self.servers.get(sid, {})
-                entry["alive"] = False
-                entry["starting"] = False
-                self.servers[sid] = entry
+            if tipo == "SRV_DEAD":
+                sid = int(dados["id"])
+                reg = self.servidores.get(sid, {})
+                reg["ativo"] = False
+                reg["iniciando"] = False
+                self.servidores[sid] = reg
                 return True
 
-            if op_type == "USER_ADD":
-                uid = int(data["uid"])
-                sid = data["sid"]
-                self.user_server[uid] = int(sid) if sid is not None else None
-                self.user_names[uid] = data.get("nome")
+            if tipo == "USER_ADD":
+                uid = int(dados["uid"])
+                sid = dados["sid"]
+                self.usuario_servidor[uid] = int(sid) if sid is not None else None
+                self.nomes_usuarios[uid] = dados.get("nome")
                 return True
 
-            if op_type == "USER_MOVE":
-                uid = int(data["uid"])
-                sid = data["sid"]
-                self.user_server[uid] = int(sid) if sid is not None else None
+            if tipo == "USER_MOVE":
+                uid = int(dados["uid"])
+                sid = dados["sid"]
+                self.usuario_servidor[uid] = int(sid) if sid is not None else None
                 return True
 
-            if op_type == "MSG_DONE":
-                sender = int(data["sender"])
-                msg_id = int(data["msg_id"])
-                dest = int(data["dest"])
-                self.processed[(sender, msg_id)] = dest
+            if tipo == "MSG_DONE":
+                remetente = int(dados["sender"])
+                id_msg = int(dados["msg_id"])
+                destinatario = int(dados["dest"])
+                self.processadas[(remetente, id_msg)] = destinatario
                 return True
 
             return False
 
-    def digest(self) -> str:
+    def resumo_crc(self) -> str:
         """Retorna o CRC32 hexadecimal de 8 dígitos do estado replicado canônico."""
         with self.lock:
-            canonical_servers = {
-                str(sid): {k: v for k, v in sorted(info.items()) if k != "reserved_at"}
-                for sid, info in sorted(self.servers.items())
+            servidores_canonicos = {
+                str(sid): {k: v for k, v in sorted(info.items()) if k != "reservado_em"}
+                for sid, info in sorted(self.servidores.items())
             }
-            canonical_user_server = {
-                str(uid): sid for uid, sid in sorted(self.user_server.items())
+            usuarios_canonicos = {
+                str(uid): sid for uid, sid in sorted(self.usuario_servidor.items())
             }
-            canonical_user_names = {
-                str(uid): name for uid, name in sorted(self.user_names.items())
+            nomes_canonicos = {
+                str(uid): nome for uid, nome in sorted(self.nomes_usuarios.items())
             }
-            canonical_processed = {
-                f"{sender}:{msg_id}": dest
-                for (sender, msg_id), dest in sorted(self.processed.items())
+            mensagens_canonicas = {
+                f"{rem}:{id_msg}": dest
+                for (rem, id_msg), dest in sorted(self.processadas.items())
             }
-            payload = json.dumps(
+            carga = json.dumps(
                 {
-                    "servers": canonical_servers,
-                    "user_server": canonical_user_server,
-                    "user_names": canonical_user_names,
-                    "processed": canonical_processed,
+                    "servers": servidores_canonicos,
+                    "user_server": usuarios_canonicos,
+                    "user_names": nomes_canonicos,
+                    "processed": mensagens_canonicas,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=True,
             ).encode("utf-8")
-            crc = zlib.crc32(payload) & 0xFFFFFFFF
+            crc = zlib.crc32(carga) & 0xFFFFFFFF
             return f"{crc:08x}"
