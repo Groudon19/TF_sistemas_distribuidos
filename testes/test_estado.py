@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from sd.estado import Estado
-from sd.common.config import port_for_server
+from sd.config import port_for_server
 
 def test_fail_server_e_idempotencia():
     st = Estado(my_id=0, is_coordinator=True, capacity=5)

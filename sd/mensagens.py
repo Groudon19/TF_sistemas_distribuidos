@@ -69,7 +69,6 @@ class Receptor:
         self.dir_logs = Path(dir_logs)
         self.dir_logs.mkdir(parents=True, exist_ok=True)
         self.caminho_registro = self.dir_logs / f"registro_{estado.meu_id}.jsonl"
-        self._arquivo_reg = self.caminho_registro.open("a", encoding="utf-8")
 
         self._lock = threading.Lock()
         self._cond_ocioso = threading.Condition(self._lock)
@@ -77,6 +76,25 @@ class Receptor:
         self._em_andamento: dict[tuple[int, int], threading.Event] = {}
         self._resultado_andamento: dict[tuple[int, int], bool] = {}
 
+        self._carregar_registro_local()
+        self._arquivo_reg = self.caminho_registro.open("a", encoding="utf-8")
+
+    def _carregar_registro_local(self) -> None:
+        if not self.caminho_registro.exists():
+            return
+        with self.caminho_registro.open("r", encoding="utf-8") as arq:
+            for linha in arq:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    reg = json.loads(linha)
+                    chave = (int(reg["sender"]), int(reg["msg_id"]))
+                    self._concluidas_local.add(chave)
+                    self.estado.marcar_processada(chave, int(reg["dest"]))
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+                
     def _persistir_local(self, remetente: int, id_msg: int, destinatario: int) -> None:
         registro = {
             "ts": round(time.time(), 6),
