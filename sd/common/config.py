@@ -1,125 +1,161 @@
 import codecs
+import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DIRETORIO_BASE = Path(__file__).resolve().parent.parent.parent
+DIRETORIO_LOGS = DIRETORIO_BASE / "logs"
 
 
-def load_env(path: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
+def carregar_env(caminho: Path) -> dict[str, str]:
+    variaveis: dict[str, str] = {}
+    if caminho.exists():
+        for linha in caminho.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if not linha or linha.startswith("#") or "=" not in linha:
                 continue
-            key, value = line.split("=", 1)
-            env[key.strip()] = value.strip().strip('"').strip("'")
-    return env
+            chave, valor = linha.split("=", 1)
+            variaveis[chave.strip()] = valor.strip().strip('"').strip("'")
+    return variaveis
 
 
-_ENV_FILE = load_env(BASE_DIR / ".env")
+_ARQUIVO_ENV = carregar_env(DIRETORIO_BASE / ".env")
 
 
-def cfg(name: str, default=None):
-    return os.environ.get(name, _ENV_FILE.get(name, default))
+def obter_cfg(nome: str, padrao=None):
+    return os.environ.get(nome, _ARQUIVO_ENV.get(nome, padrao))
 
 
-def cfg_int(name: str, default: int | None = None, minimo: int | None = None, maximo: int | None = None) -> int:
-    raw = cfg(name, default)
+def obter_int(nome: str, padrao: int | None = None, minimo: int | None = None, maximo: int | None = None) -> int:
+    bruto = obter_cfg(nome, padrao)
     try:
-        value = int(str(raw).strip())
+        valor = int(str(bruto).strip())
     except (TypeError, ValueError):
-        sys.exit(f"Erro de configuração: {name} deve ser inteiro (recebido: {raw!r})")
-    if minimo is not None and value < minimo:
-        sys.exit(f"Erro de configuração: {name} deve ser >= {minimo} (recebido: {value})")
-    if maximo is not None and value > maximo:
-        sys.exit(f"Erro de configuração: {name} deve ser <= {maximo} (recebido: {value})")
-    return value
+        sys.exit(f"Erro de configuração: {nome} deve ser inteiro (recebido: {bruto!r})")
+    if minimo is not None and valor < minimo:
+        sys.exit(f"Erro de configuração: {nome} deve ser >= {minimo} (recebido: {valor})")
+    if maximo is not None and valor > maximo:
+        sys.exit(f"Erro de configuração: {nome} deve ser <= {maximo} (recebido: {valor})")
+    return valor
 
 
-def cfg_float(name: str, default: float, minimo: float = 0.0) -> float:
-    raw = cfg(name, default)
+def obter_float(nome: str, padrao: float, minimo: float = 0.0) -> float:
+    bruto = obter_cfg(nome, padrao)
     try:
-        value = float(str(raw).strip())
+        valor = float(str(bruto).strip())
     except (TypeError, ValueError):
-        sys.exit(f"Erro de configuração: {name} deve ser número (recebido: {raw!r})")
-    if value < minimo:
-        sys.exit(f"Erro de configuração: {name} deve ser >= {minimo} (recebido: {value})")
-    return value
+        sys.exit(f"Erro de configuração: {nome} deve ser número (recebido: {bruto!r})")
+    if valor < minimo:
+        sys.exit(f"Erro de configuração: {nome} deve ser >= {minimo} (recebido: {valor})")
+    return valor
 
 
-# Obrigatórias no .env
-SERVER_IP = cfg("SERVER_IP")
-if not SERVER_IP or not cfg("SERVER_PORT"):
+# Configurações obrigatórias do .env
+IP_SERVIDOR = obter_cfg("SERVER_IP")
+if not IP_SERVIDOR or not obter_cfg("SERVER_PORT"):
     sys.exit("Erro de configuração: SERVER_IP e SERVER_PORT são obrigatórias no .env")
 
-SERVER_PORT = cfg_int("SERVER_PORT", None, 1, 65535)
-ENCODING = str(cfg("ENCODING", "utf-8"))
+PORTA_SERVIDOR = obter_int("SERVER_PORT", None, 1, 65535)
+CODIFICACAO = str(obter_cfg("ENCODING", "utf-8"))
 try:
-    codecs.lookup(ENCODING)
+    codecs.lookup(CODIFICACAO)
 except LookupError:
-    sys.exit(f"Erro de configuração: ENCODING desconhecido ({ENCODING!r})")
+    sys.exit(f"Erro de configuração: ENCODING desconhecido ({CODIFICACAO!r})")
 
 # Conexão de retorno com o Cadastro (NEWID / NEWCOORDINATORIP)
-CADASTRO_IP = str(cfg("CADASTRO_IP", "127.0.0.1"))
-CONTROL_PORT = cfg_int("CONTROL_PORT", 6001, 1, 65535)
-INITIAL_SERVER_ID = cfg_int("INITIAL_SERVER_ID", 0, 0)
-BIND_IP = str(cfg("BIND_IP", SERVER_IP))
+IP_CADASTRO = str(obter_cfg("CADASTRO_IP", "127.0.0.1"))
+PORTA_CONTROLE = obter_int("CONTROL_PORT", 6001, 1, 65535)
+ID_SERVIDOR_INICIAL = obter_int("INITIAL_SERVER_ID", 0, 0)
+IP_BIND = str(obter_cfg("BIND_IP", IP_SERVIDOR))
 
-# Constantes do domínio (PDF)
-MAX_USERS_PER_SERVER = 5
-RECOVERY_DELAY_SEC = 5.0
-NET_TIMEOUT_SEC = cfg_float("NET_TIMEOUT_SEC", 3.0, 0.1)
+# Constantes do domínio
+MAX_USUARIOS_POR_SERVIDOR = 5
+ATRASO_RECUPERACAO_SEG = 5.0
+TIMEOUT_REDE_SEG = obter_float("NET_TIMEOUT_SEC", 3.0, 0.1)
 
-LOGS_DIR = BASE_DIR / "logs"
+_MAX_SERVIDORES_BRUTO = obter_int("MAX_SERVERS", 20, 1)
+MAX_SERVIDORES = min(_MAX_SERVIDORES_BRUTO, 65535 - PORTA_SERVIDOR + 1)
+
+# Escalonamento e processos
+TIMEOUT_CRIACAO_SEG = obter_float("SPAWN_TIMEOUT_SEC", 10.0, 0.5)
+LIMITE_FALHAS_CRIACAO = obter_int("SPAWN_FAIL_LIMIT", 3, 1)
+BACKOFF_CRIACAO_SEG = obter_float("SPAWN_BACKOFF_SEC", 5.0, 0.1)
+TEMPO_OCIOSO_SEG = obter_float("IDLE_GRACE_SEC", 3.0, 0.0)
+INTERVALO_ESCALADOR_SEG = obter_float("SCALER_INTERVAL_SEC", 0.5, 0.05)
+TIMEOUT_INTERNO_SEG = obter_float("INTERNAL_TIMEOUT_SEC", 1.0, 0.1)
+TENTATIVAS_HELLO = obter_int("HELLO_RETRIES", 20, 1)
+ATRASO_TENTATIVA_HELLO_SEG = obter_float("HELLO_RETRY_DELAY", 0.25, 0.01)
+
+# Replicação e mensagens
+ESPERA_REPLICACAO_SEG = obter_float("REPL_WAIT_SEC", 0.5, 0.05)
+ATRASO_RECONEXAO_REPL_SEG = obter_float("REPL_RECONNECT_DELAY_SEC", 0.5, 0.05)
+TIMEOUT_LINK_REPL_SEG = obter_float("REPL_LINK_TIMEOUT_SEC", 1.0, 0.1)
+
+# Garante que espera de vaga + replicação cabe nos 3s de timeout do Cadastro
+_TIMEOUT_ENVIO_CADASTRO = obter_float("SEND_TIMEOUT", 3.0, 0.1)
+_ESPERA_NEWUSER_BRUTA = obter_float("NEWUSER_WAIT_SEC", 2.0, 0.0)
+ESPERA_NEWUSER_SEG = max(0.0, min(_ESPERA_NEWUSER_BRUTA, _TIMEOUT_ENVIO_CADASTRO - 1.0 - ESPERA_REPLICACAO_SEG))
+
+INTERVALO_MAX_MSG_SEG = obter_float("MSG_MAX_INTERVAL_SEC", 10.0, 0.05)
+TIMEOUT_ACK_MSG_SEG = obter_float("MSG_ACK_TIMEOUT_SEC", 5.0, 0.2)
+MAX_TENTATIVAS_MSG = obter_int("MSG_MAX_ATTEMPTS", 10, 1)
+PRAZO_ROTEAMENTO_SEG = obter_float("ROUTE_DEADLINE_SEC", 3.5, 0.2)
+TIMEOUT_ENTREGA_SEG = obter_float("DELIVER_TIMEOUT_SEC", 2.0, 0.1)
+ATRASO_RECEIVE_MSG_SEG = obter_float("RECEIVE_MSG_DELAY_SEC", 1.0, 0.0)
+TIMEOUT_DRENAGEM_SEG = obter_float("DRAIN_TIMEOUT_SEC", 3.0, 0.1)
+PROB_PERDA_ACK_CAOS = obter_float("CHAOS_DROP_ACK_PROB", 0.0, 0.0)
 
 
-def port_for_server(server_id: int) -> int:
-    """
-    Calcula a porta TCP de um servidor dado seu ID.
-    Servidor 0 -> SERVER_PORT (5001), Servidor 1 -> 5002, etc.
-    """
-    if server_id < 0:
-        raise ValueError("server_id deve ser >= 0")
-    port = SERVER_PORT + server_id
-    if port > 65535:
-        raise ValueError(f"Porta calculada fora do limite: {port}")
-    return port
+def porta_do_servidor(id_servidor: int) -> int:
+    """Calcula a porta TCP de um servidor dado seu ID (0 -> PORTA_SERVIDOR, 1 -> +1, etc.)."""
+    if id_servidor < 0:
+        raise ValueError("id_servidor deve ser >= 0")
+    porta = PORTA_SERVIDOR + id_servidor
+    if porta > 65535:
+        raise ValueError(f"Porta calculada fora do limite: {porta}")
+    return porta
 
 
-# Adicione ao final de sd/common/config.py:
-_RAW_MAX_SERVERS = cfg_int("MAX_SERVERS", 20, 1)
-MAX_SERVERS = min(_RAW_MAX_SERVERS, 65535 - SERVER_PORT + 1)
+class LoggerMetricas:
+    """Logger thread-safe em formato JSON Lines (um registro JSON por linha)."""
 
-_CADASTRO_SEND_TIMEOUT = cfg_float("SEND_TIMEOUT", 3.0, 0.1)
-_RAW_NEWUSER_WAIT = cfg_float("NEWUSER_WAIT_SEC", 2.0, 0.0)
-NEWUSER_WAIT_SEC = max(0.0, min(_RAW_NEWUSER_WAIT, _CADASTRO_SEND_TIMEOUT - 1.0))
+    def __init__(self, componente: str, id_no: int, dir_logs: Path = DIRETORIO_LOGS):
+        self.componente = componente
+        self.id_no = id_no
+        self.dir_logs = dir_logs
+        self.dir_logs.mkdir(parents=True, exist_ok=True)
+        self.caminho_arquivo = self.dir_logs / f"servidor_{id_no}.jsonl"
+        self._lock = threading.Lock()
 
-SPAWN_TIMEOUT_SEC = cfg_float("SPAWN_TIMEOUT_SEC", 10.0, 0.5)
-SPAWN_FAIL_LIMIT = cfg_int("SPAWN_FAIL_LIMIT", 3, 1)
-SPAWN_BACKOFF_SEC = cfg_float("SPAWN_BACKOFF_SEC", 5.0, 0.1)
-IDLE_GRACE_SEC = cfg_float("IDLE_GRACE_SEC", 3.0, 0.0)
-SCALER_INTERVAL_SEC = cfg_float("SCALER_INTERVAL_SEC", 0.5, 0.05)
-INTERNAL_TIMEOUT_SEC = cfg_float("INTERNAL_TIMEOUT_SEC", 1.0, 0.1)
-HELLO_RETRIES = cfg_int("HELLO_RETRIES", 20, 1)
-HELLO_RETRY_DELAY = cfg_float("HELLO_RETRY_DELAY", 0.25, 0.01)
+    def definir_componente(self, componente: str) -> None:
+        """Alterna entre 'servidor' e 'coordenador' (por exemplo, após eleição)."""
+        with self._lock:
+            self.componente = componente
 
-# --- Fase 5: Replicação e Mensagens ---
-REPL_WAIT_SEC = cfg_float("REPL_WAIT_SEC", 0.5, 0.05)
-REPL_RECONNECT_DELAY_SEC = cfg_float("REPL_RECONNECT_DELAY_SEC", 0.5, 0.05)
-REPL_LINK_TIMEOUT_SEC = cfg_float("REPL_LINK_TIMEOUT_SEC", 1.0, 0.1)
-
-# Orçamento de 3 s do Cadastro: NEWUSER_WAIT_SEC + REPL_WAIT_SEC <= SEND_TIMEOUT - 1.0
-_CADASTRO_SEND_TIMEOUT = cfg_float("SEND_TIMEOUT", 3.0, 0.1)
-_RAW_NEWUSER_WAIT = cfg_float("NEWUSER_WAIT_SEC", 2.0, 0.0)
-NEWUSER_WAIT_SEC = max(0.0, min(_RAW_NEWUSER_WAIT, _CADASTRO_SEND_TIMEOUT - 1.0 - REPL_WAIT_SEC))
-
-MSG_MAX_INTERVAL_SEC = cfg_float("MSG_MAX_INTERVAL_SEC", 10.0, 0.05)
-MSG_ACK_TIMEOUT_SEC = cfg_float("MSG_ACK_TIMEOUT_SEC", 5.0, 0.2)
-MSG_MAX_ATTEMPTS = cfg_int("MSG_MAX_ATTEMPTS", 10, 1)
-ROUTE_DEADLINE_SEC = cfg_float("ROUTE_DEADLINE_SEC", 3.5, 0.2)
-DELIVER_TIMEOUT_SEC = cfg_float("DELIVER_TIMEOUT_SEC", 2.0, 0.1)
-RECEIVE_MSG_DELAY_SEC = cfg_float("RECEIVE_MSG_DELAY_SEC", 1.0, 0.0)
-DRAIN_TIMEOUT_SEC = cfg_float("DRAIN_TIMEOUT_SEC", 3.0, 0.1)
-CHAOS_DROP_ACK_PROB = cfg_float("CHAOS_DROP_ACK_PROB", 0.0, 0.0)
+    def registrar(
+        self,
+        metrica: str,
+        valor: int | float = 1,
+        *,
+        componente: str | None = None,
+        id_no: int | None = None,
+        **extras,
+    ) -> None:
+        with self._lock:
+            registro = {
+                **extras,
+                "ts": round(time.time(), 3),
+                "componente": componente or self.componente,
+                "id": self.id_no if id_no is None else id_no,
+                "metrica": metrica,
+                "valor": valor,
+            }
+            try:
+                linha = json.dumps(registro, ensure_ascii=False) + "\n"
+                with self.caminho_arquivo.open("a", encoding="utf-8") as arq:
+                    arq.write(linha)
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"[aviso] falha ao gravar métrica {metrica!r}: {exc}")

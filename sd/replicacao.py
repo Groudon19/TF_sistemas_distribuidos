@@ -21,7 +21,6 @@ class OpLog:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.log_dir / f"oplog_{node_id}.jsonl"
 
-        # No boot, renomeia log anterior se existir
         if self.path.exists():
             backup = self.log_dir / f"oplog_{node_id}_{int(time.time())}.bak.jsonl"
             try:
@@ -86,6 +85,7 @@ class Aplicador:
         self.logger = logger
         self.epoch = epoch
         self.last_seq = 0
+        self.first_repl_ts: float | None = None
         self.on_applied_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -93,8 +93,12 @@ class Aplicador:
         op = parse_repl(line)
         op_epoch = op["epoch"]
         seq = op["seq"]
+        is_recovery = bool(op.pop("recovery", False))
 
         with self._lock:
+            if self.first_repl_ts is None:
+                self.first_repl_ts = time.monotonic()
+
             if op_epoch < self.epoch:
                 return f"ERROR_STALE_EPOCH_{self.epoch}", False
 
@@ -107,11 +111,14 @@ class Aplicador:
             if not self.state.apply_op(op):
                 raise ProtocolError("INVALID_FORMAT", f"Operação inválida: {op.get('type')}")
 
+            # Grava op limpo (sem 'recovery') para manter idêntico ao OpLog do líder
             self.oplog.record_replicated(op)
             self.last_seq = seq
 
-        delay = max(0.0, round(time.time() - float(op["ts"]), 6))
-        self.logger.log("atraso_replicacao", valor=delay, seq=seq, tipo=op["type"])
+        if not is_recovery:
+            delay = max(0.0, round(time.time() - float(op["ts"]), 6))
+            self.logger.log("atraso_replicacao", valor=delay, seq=seq, tipo=op["type"])
+
         self.on_applied_event.set()
         return f"ACK_REPL_{seq}", False
 
@@ -134,6 +141,7 @@ class ReplicaLink:
         target_sync_seq: int,
         on_ack_cb: Callable[[int, int, str], None],
         on_stale_epoch_cb: Callable[[int], None],
+        logger: MetricsLogger | None = None,
         send_fn: Callable[[str, int, str], str] | None = None,
     ):
         self.follower_id = follower_id
@@ -143,11 +151,13 @@ class ReplicaLink:
         self.target_sync_seq = target_sync_seq
         self.on_ack_cb = on_ack_cb
         self.on_stale_epoch_cb = on_stale_epoch_cb
+        self.logger = logger
         self.send_fn = send_fn
 
         self.cursor = 1
         self.acked_seq = 0
         self.status = "SYNCED" if target_sync_seq == 0 else "CATCHING_UP"
+        self._unexpected_logged = False
 
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -190,7 +200,6 @@ class ReplicaLink:
         send_line(self._sock, line)
         reply = self._reader.read_line(timeout=config.REPL_LINK_TIMEOUT_SEC)
         if reply is None:
-            # Servidor fechou conexão ociosa (timeout de 30s) -> reconecta imediatamente
             self._close_socket()
             sock = socket.create_connection((self.ip, self.port), timeout=config.REPL_LINK_TIMEOUT_SEC)
             self._sock = sock
@@ -209,8 +218,14 @@ class ReplicaLink:
                 self._wake.clear()
                 continue
 
+            # Marca operações que faziam parte do backlog inicial de recuperação
+            if self.cursor <= self.target_sync_seq:
+                wire_op = {**op, "recovery": True}
+            else:
+                wire_op = op
+
             try:
-                reply = self._send_wire(fmt_repl(op))
+                reply = self._send_wire(fmt_repl(wire_op))
             except (OSError, ValueError):
                 self._close_socket()
                 self._stop.wait(timeout=config.REPL_RECONNECT_DELAY_SEC)
@@ -220,16 +235,18 @@ class ReplicaLink:
                 try:
                     n = int(reply.split("_")[-1])
                 except ValueError:
-                    continue
+                    n = -1
                 if n >= self.cursor:
+                    self._unexpected_logged = False
                     self.cursor = n + 1
                     self.acked_seq = max(self.acked_seq, n)
                     if self.status in ("CATCHING_UP", "LAGGING") and self.acked_seq >= self.target_sync_seq:
                         self.status = "SYNCED"
                     self.on_ack_cb(self.follower_id, self.acked_seq, self.status)
-                continue
+                    continue
 
             if reply.startswith("ERROR_GAP_"):
+                self._unexpected_logged = False
                 try:
                     last = int(reply.split("_")[-1])
                     self.cursor = max(1, last + 1)
@@ -240,6 +257,18 @@ class ReplicaLink:
             if reply.startswith("ERROR_STALE_EPOCH"):
                 self.on_stale_epoch_cb(self.follower_id)
                 break
+
+            # Resposta inesperada ou ACK com n < cursor: evita loop de CPU e loga só 1 vez
+            if not self._unexpected_logged and self.logger is not None:
+                self._unexpected_logged = True
+                self.logger.log(
+                    "erro_replicacao_resposta",
+                    valor=1,
+                    seguidor=self.follower_id,
+                    cursor=self.cursor,
+                    resposta=reply[:80],
+                )
+            self._stop.wait(timeout=config.REPL_RECONNECT_DELAY_SEC)
 
 
 class Replicador:
@@ -284,6 +313,7 @@ class Replicador:
             target_sync_seq=head_seq,
             on_ack_cb=self._on_link_ack,
             on_stale_epoch_cb=self._on_stale_epoch,
+            logger=self.logger,
             send_fn=self.send_fn,
         )
         with self._lock:

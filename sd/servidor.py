@@ -170,10 +170,10 @@ def main() -> None:
 
         roteador = Roteador(coordenador=coordinator, logger=logger)
         coordinator.register_handler("MSG", roteador.handle_msg)
-        coordinator.register_handler(
-            "DIGEST",
-            lambda _line: (fmt_digest(oplog.head(), state.digest()), False),
-        )
+        coordinator.register_handler("DIGEST", coordinator.handle_digest)
+        
+        coordinator.attach_scaler(escalador)
+        wake_evt = coordinator.on_state_change_event
 
         escalador = Escalador(
             coordenador=coordinator,

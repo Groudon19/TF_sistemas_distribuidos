@@ -11,6 +11,7 @@ from sd.common.protocolo import (
     fmt_ack_newuser,
     fmt_ack_shutdown,
     fmt_error,
+    fmt_digest,
     parse_command,
     parse_hello,
     parse_kill,
@@ -39,6 +40,7 @@ class Coordenador:
             "HELLO": self.handle_hello,
             "SHUTDOWN": self.handle_shutdown,
         }
+        self.on_state_change_event = threading.Event()
 
     def register_handler(self, prefix: str, fn: Callable[[str], tuple[str, bool]]) -> None:
         self._handlers[prefix] = fn
@@ -377,3 +379,25 @@ class Coordenador:
             assert snap is not None
             self._emit_balance("desativacao", snap)
         return retired
+    
+    def handle_digest(self, _line: str) -> tuple[str, bool]:
+        """Retorna DIGEST_<head>_<crc> de forma atômica sob _op_lock."""
+        with self._op_lock:
+            head = self.replicador.oplog.head() if self.replicador is not None else 0
+            crc = self.state.digest()
+        return fmt_digest(head, crc), False
+    
+    def handle_line(self, line: str) -> tuple[str, bool]:
+        try:
+            cmd = parse_command(line)
+            handler = self._handlers.get(cmd)
+            if handler is None:
+                return fmt_error("INVALID_COMMAND"), False
+            return handler(line)
+        except ConnectionResetError:
+            raise
+        except ProtocolError as exc:
+            return fmt_error(exc.code), False
+        except Exception as exc:
+            self.logger.log("erro_interno", valor=1, erro=str(exc), linha=line.strip())
+            return fmt_error("INTERNAL"), False
