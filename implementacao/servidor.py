@@ -2,7 +2,9 @@ import socket
 import traceback
 import config
 import logs
-import mensagens        
+import mensagens
+import coordenador
+import rede        
 
 class Servidor:
     def __init__(self, id: int, ip: str, port: int, usuarios: dict = None):
