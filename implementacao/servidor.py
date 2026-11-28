@@ -46,6 +46,9 @@ class Servidor:
 
         self.coordenador_addr = (config.SERVER_IP, config.SERVER_PORT)
         self.papel_coordenador: coordenador.Coordenador | None = None
+        
+        self._arquivo_msg_ids = config.STATE_DIR / f"msg_ids_servidor_{self.id}.txt"
+        self._limpar_arquivos_anteriores(limpar_cluster=(self.id == config.INITIAL_SERVER_ID))
 
         logs.init_log(config.BASE_DIR / "logs" / f"servidor_{self.id}.jsonl", "Servidor", self.id)
         logs.log_event(
@@ -60,6 +63,24 @@ class Servidor:
         for uid in list(self.usuarios.keys()):
             self._iniciar_thread_usuario(uid)
 
+    
+    def _limpar_arquivos_anteriores(self, limpar_cluster: bool = False):
+        """Remove logs (.jsonl) e estados (.txt) anteriores antes de iniciar o nó."""
+        if limpar_cluster:
+            if config.STATE_DIR.exists():
+                for arq in config.STATE_DIR.glob("*.txt"):
+                    arq.unlink(missing_ok=True)
+            log_dir = config.BASE_DIR / "logs"
+            if log_dir.exists():
+                for arq in log_dir.glob("*.jsonl"):
+                    arq.unlink(missing_ok=True)
+            return
+
+        self._arquivo_msg_ids.unlink(missing_ok=True)
+        log_path = config.BASE_DIR / "logs" / f"servidor_{self.id}.jsonl"
+        log_path.unlink(missing_ok=True)
+    
+    
     def _carregar_mensagens_processadas(self) -> set[int]:
         """Carrega do disco os MSG_IDs já processados anteriormente por este servidor."""
         config.STATE_DIR.mkdir(parents=True, exist_ok=True)
