@@ -182,10 +182,7 @@ def normalize_message(raw: str) -> Mensagem:
     
     m = ACK_RE.fullmatch(text)
     if m:
-        msg_id = int(m.group(1))
-        if msg_id <= 0:
-            raise InvalidMessage("O ID da mensagem deve ser maior que zero")
-        return Ack(msg_id)
+        return Ack(m.group(1))
     
     m = ERROR_RE.fullmatch(text)
     if m:
