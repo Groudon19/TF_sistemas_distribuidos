@@ -96,3 +96,29 @@ Cada nó na tabela `self.servidores` transita entre três estados:
 | `REGISTER_<ID>_<IP>_<PORT>` | Servidor $\rightarrow$ Coordenador | `ACK_REGISTER_<ID>` | Anuncia um novo servidor ao coordenador inicial. |
 | `NEWID_<ID>` | Coordenador $\rightarrow$ Cadastro (`:6001`) | `ACK_NEWID_<ID>` | Informa ao Cadastro que um novo servidor foi ativado. |
 | `KILL_<ID>` | Cadastro / Teste $\rightarrow$ Coordenador | `ACK_KILL_<ID>` | Reconhecido no protocolo (será expandido na fase de falhas/eleição). |
+
+## Fase 4: Troca de Mensagens entre Usuários
+
+### Objetivo
+Implementar o fluxo contínuo de troca de mensagens entre usuários distribuídos em diferentes servidores do cluster, passando pelo roteamento centralizado do coordenador, processamento simulado no destino e confirmação ponta a ponta (`ACK`).
+
+### Alterações Realizadas
+
+* **`mensagens.py`:**
+  * Adicionada a mensagem auxiliar `UserList` (`USERS_<id1>,<id2>,...`) e sua expressão regular (`USERS_RE`) para sincronização dos IDs de usuários ativos no cluster.
+  * Adicionada a sanitização de conteúdo (`sanitize_content`) para `Msg` (`MSG_<msg_id>_<sender_id>_<dest_id>_<conteudo>`), removendo quebras de linha e caracteres de controle para preservar o enquadramento do protocolo TCP.
+  * Padronizada a classe `Ack` (`ACK_<referencia>`) para suportar tanto confirmações de mensagens (`ACK_<msg_id>`) quanto comandos internos.
+
+* **`servidor.py`:**
+  * Criada uma thread *daemon* dedicada por usuário hospedado (`_loop_usuario`), disparada automaticamente em `adicionar_usuario` via `_iniciar_thread_usuario`.
+  * Cada thread gera `msg_id` únicos sem colisão (`sender_id * 1_000_000 + seq`) e envia mensagens em intervalos aleatórios de até `MAX_MSG_INTERVAL` (`10 s`) para destinatários válidos da lista `usuarios_conhecidos`.
+  * Implementados `receive_msg` (com atraso simulado de `RECEIVE_MSG_DELAY = 1.0 s`) e `receber_mensagem`, garantindo idempotência no destino por meio do conjunto `mensagens_recebidas` protegido por `Lock`.
+  * Adicionado suporte ao recebimento de `UserList` (`USERS_...`) para atualização dinâmica da lista local de destinatários.
+
+* **`coordenador.py`:**
+  * Implementado o método `rotear_mensagem`, que consulta `usuarios_alocados` para localizar o servidor de destino, realiza entrega local (quando o destinatário está no próprio coordenador) ou encaminha via TCP (`rede.enviar` com `ACK_TIMEOUT` e `MAX_ACK_RETRIES`), devolvendo o `ACK_<msg_id>` ao remetente.
+  * Implementado `_difundir_lista_usuarios`, invocado após cada novo cadastro confirmado em `processar_novo_usuario`, mantendo todos os servidores ativos sincronizados quanto aos destinatários disponíveis.
+
+### Validação
+* Testes realizados com usuários distribuídos entre múltiplos servidores (`servidor_0` e `servidor_1`).
+* Os arquivos de log (`logs/servidor_*.jsonl`) confirmaram o ciclo completo e correlacionado pelo `msg_id`: `msg_enviada` $\rightarrow$ `msg_roteada` $\rightarrow$ `msg_recebida` $\rightarrow$ `ack_enviado` $\rightarrow$ `ack_recebido`.
