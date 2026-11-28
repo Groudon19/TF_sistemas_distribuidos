@@ -141,7 +141,8 @@ class Servidor:
             total = len(self.usuarios)
             
         logs.log_event("usuario_adicionado", user_id=user_id, nome=nome, total=len(self.usuarios))
-        return f"ACK_NEWUSER_{user_id}"
+        self._iniciar_thread_usuario(user_id)
+        return str(mensagens.Ack(f"ACK_NEWUSER_{user_id}"))
         
     def responder(self, mensagem: mensagens.Mensagem) -> str:
         if self.papel_coordenador is not None:

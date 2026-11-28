@@ -93,7 +93,7 @@ class Msg(Mensagem):
         return f"MSG_{self.msg_id}_{self.sender_id}_{self.dest_id}_{self.conteudo}"
     
 class Ack(Mensagem):
-    __match_args__ = ("msg_id",)
+    __match_args__ = ("referencia",)
     
     def __init__(self, referencia: int | str):
         self.referencia = referencia

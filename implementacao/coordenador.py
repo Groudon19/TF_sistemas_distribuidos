@@ -260,12 +260,8 @@ class Coordenador:
         with self.lock:
             self.usuarios_alocados[user_id] = server_id
 
-        logs.log_event(
-            "usuario_roteado",
-            user_id=user_id,
-            nome=new_user.nome,
-            servidor_destino=server_id,
-        )
+        logs.log_event("usuario_roteado",user_id=user_id,nome=new_user.nome,servidor_destino=server_id,)
+        self._difundir_lista_usuarios()
         return resp
     
     def rotear_mensagem(self, msg: mensagens.Msg) -> str:
