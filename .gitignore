@@ -5,5 +5,11 @@ __pycache__
 *.json
 *.out
 
+<<<<<<< Updated upstream
 logs/
 tools/
+=======
+cadastro.json
+.vscode/
+.pytest_cache/
+>>>>>>> Stashed changes
