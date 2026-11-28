@@ -122,3 +122,39 @@ Implementar o fluxo contínuo de troca de mensagens entre usuários distribuído
 ### Validação
 * Testes realizados com usuários distribuídos entre múltiplos servidores (`servidor_0` e `servidor_1`).
 * Os arquivos de log (`logs/servidor_*.jsonl`) confirmaram o ciclo completo e correlacionado pelo `msg_id`: `msg_enviada` $\rightarrow$ `msg_roteada` $\rightarrow$ `msg_recebida` $\rightarrow$ `ack_enviado` $\rightarrow$ `ack_recebido`.
+
+## Fase 5: Idempotência, Persistência em Disco e Reenvio
+
+### Objetivo
+Garantir que retransmissões de mensagens com o mesmo `MSG_ID` (seja por atraso na rede/destino acima de `ACK_TIMEOUT` ou por reenvios manuais) não executem `receive_msg()` mais de uma vez, mantendo registro persistente em disco e métricas explícitas de validação.
+
+### Alterações Realizadas
+
+* **`config.py`:**
+  * Adicionada a constante `STATE_DIR = BASE_DIR / "estado"` para armazenar os arquivos de estado persistente de cada servidor.
+
+* **`servidor.py`:**
+  * Implementada a persistência em disco dos `MSG_ID`s processados (`estado/msg_ids_servidor_<id>.txt`) por meio de `_carregar_mensagens_processadas` e `_persistir_msg_id` (com `flush()` e `os.fsync()`), garantindo sobrevivência entre reinicializações.
+  * Adicionada limpeza automática dos logs (`.jsonl`) e estados (`.txt`) anteriores na inicialização (`_limpar_arquivos_anteriores`), permitindo execuções limpas a cada nova rodada do cluster.
+  * Implementado controle de deduplicação concorrente (*in-flight*) via `_mensagens_em_processamento: dict[int, threading.Event]` em `receber_mensagem`: caso uma retransmissão chegue enquanto a primeira execução de `receive_msg()` ainda está em andamento, a requisição duplicada aguarda o evento sem reexecutar o processamento e responde `ACK_<msg_id>`.
+  * Adicionados contadores e eventos de log para `execucoes_receive_msg`, `execucoes_duplicadas` e `acks_reenviados` (`ack_reenviado` e `metricas_idempotencia`), além da flag de linha de comando `--delay` para simular servidores lentos acima de `ACK_TIMEOUT`.
+
+---
+
+## Fase 6: Comando KILL, Redistribuição de Usuários e Scale-Down
+
+### Objetivo
+Permitir o desligamento controlado de servidores secundários via `KILL_<id>`, migrando automaticamente todos os usuários hospedados no nó encerrado para os demais servidores disponíveis e devolvendo servidores ociosos ao estado de reserva.
+
+### Alterações Realizadas
+
+* **`servidor.py`:**
+  * Implementado o método `encerrar_por_kill(server_id)` e o tratamento de `mensagens.Kill` em `responder()`: ao receber a ordem de desligamento, o servidor limpa `self.usuarios` e `self._threads_usuarios` (interrompendo as threads de envio dos usuários locais), registra `servidor_encerrado_por_kill`, responde `ACK_KILL_<id>` e agenda a parada do socket (`stop_event.set()`) junto com o registro das métricas finais.
+
+* **`coordenador.py`:**
+  * Adicionado o dicionário `nomes_usuarios` para preservar o mapeamento `user_id -> nome` e possibilitar a migração completa via `NEWUSER_<id>_<nome>`.
+  * Extraída a rotina `_alocar_e_enviar_usuario`, reutilizada tanto no cadastro inicial quanto na migração após falhas/desligamentos (incluindo ativação de reservas ou criação sob demanda se necessário).
+  * Implementado `processar_kill(server_id)`:
+    * Bloqueia `KILL_0` (`ERROR_CANNOT_KILL_COORDINATOR`), reservando a troca de liderança para a fase de eleição.
+    * Marca o servidor alvo como `"morto"`, envia `KILL_<id>` via TCP e redistribui determinísticamente todos os usuários afetados, registrando cada migração (`usuario_migrado`) e o total consolidado (`kill_processado` com `usuarios_migrados`).
+  * Implementado `_desativar_servidores_ociosos()` (*scale-down*), retornando automaticamente para o estado `"reserva"` qualquer servidor secundário ativo que fique com `ocupacao == 0`.
