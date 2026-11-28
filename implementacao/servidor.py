@@ -36,6 +36,7 @@ class Servidor:
 
         # Idempotência persistente e controle de concorrência (Fase 5)
         self._arquivo_msg_ids = config.STATE_DIR / f"msg_ids_servidor_{self.id}.txt"
+        self._limpar_arquivos_anteriores(limpar_cluster=(self.id == config.INITIAL_SERVER_ID))
         self.mensagens_recebidas: set[int] = self._carregar_mensagens_processadas()
         self._mensagens_em_processamento: dict[int, threading.Event] = {}
         self._execucoes_por_msg: dict[int, int] = {}
@@ -46,9 +47,6 @@ class Servidor:
 
         self.coordenador_addr = (config.SERVER_IP, config.SERVER_PORT)
         self.papel_coordenador: coordenador.Coordenador | None = None
-        
-        self._arquivo_msg_ids = config.STATE_DIR / f"msg_ids_servidor_{self.id}.txt"
-        self._limpar_arquivos_anteriores(limpar_cluster=(self.id == config.INITIAL_SERVER_ID))
 
         logs.init_log(config.BASE_DIR / "logs" / f"servidor_{self.id}.jsonl", "Servidor", self.id)
         logs.log_event(
@@ -63,7 +61,6 @@ class Servidor:
         for uid in list(self.usuarios.keys()):
             self._iniciar_thread_usuario(uid)
 
-    
     def _limpar_arquivos_anteriores(self, limpar_cluster: bool = False):
         """Remove logs (.jsonl) e estados (.txt) anteriores antes de iniciar o nó."""
         if limpar_cluster:
@@ -79,8 +76,7 @@ class Servidor:
         self._arquivo_msg_ids.unlink(missing_ok=True)
         log_path = config.BASE_DIR / "logs" / f"servidor_{self.id}.jsonl"
         log_path.unlink(missing_ok=True)
-    
-    
+
     def _carregar_mensagens_processadas(self) -> set[int]:
         """Carrega do disco os MSG_IDs já processados anteriormente por este servidor."""
         config.STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -322,6 +318,26 @@ class Servidor:
         self._iniciar_thread_usuario(user_id)
         return str(mensagens.Ack(f"NEWUSER_{user_id}"))
 
+    def encerrar_por_kill(self, server_id: int) -> str:
+        """Encerra threads dos usuários hospedados e agenda a parada do servidor após responder ACK."""
+        if server_id != self.id:
+            return str(mensagens.Error("WRONG_SERVER"))
+
+        with self.lock:
+            qtd_usuarios = len(self.usuarios)
+            self.usuarios.clear()
+            self._threads_usuarios.clear()
+
+        logs.log_event("servidor_encerrado_por_kill", usuarios_removidos=qtd_usuarios)
+        print(f"[kill] Servidor {self.id} desligando ({qtd_usuarios} usuários encerrados)...")
+
+        def _parar_apos_ack():
+            self.registrar_metricas_finais()
+            self.stop_event.set()
+
+        threading.Timer(0.15, _parar_apos_ack).start()
+        return str(mensagens.Ack(f"KILL_{server_id}"))
+
     def responder(self, mensagem: mensagens.Mensagem) -> str:
         if self.papel_coordenador is not None:
             resposta = self.papel_coordenador.tratar_mensagem(mensagem)
@@ -336,6 +352,8 @@ class Servidor:
             case mensagens.UserList(user_ids):
                 self.atualizar_usuarios_conhecidos(user_ids)
                 return str(mensagens.Ack("USERS"))
+            case mensagens.Kill(server_id):
+                return self.encerrar_por_kill(server_id)
             case _:
                 logs.log_event("mensagem_inesperada", mensagem=str(mensagem))
                 return str(mensagens.Error("UNEXPECTED_MESSAGE"))
