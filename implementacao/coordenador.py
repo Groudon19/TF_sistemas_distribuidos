@@ -39,14 +39,7 @@ class Coordenador:
             self.ocupacao.setdefault(msg.server_id, 0)
             total = len(self.servidores)
             
-        logs.log_event(
-            "servidor_registrado",
-            servidor_id = msg.server_id,
-            ip = msg.ip,
-            porta = msg.port,
-            estado = estado,
-            total_servidores = total,
-        )
+        logs.log_event("servidor_registrado",servidor_id = msg.server_id,ip = msg.ip,porta = msg.port,estado = estado,total_servidores = total,)
         
         with self.lock:
             evt = self._eventos_registro.pop(msg.server_id, None)
@@ -63,9 +56,39 @@ class Coordenador:
     def _enviar_para_servidor(self, server_id: int, ip: str, porta: int, mensagem: mensagens.Mensagem) -> tuple[bool, str]:
         """Entrega a mensagem localmente (se server_id == self.servidor.id) ou via TCP."""
         if server_id == self.servidor.id:
-            resp = self.servidor.adicionar_usuario(mensagem) if isinstance(mensagem, mensagens.NewUser) else self.servidor.responder(mensagem)
+            if isinstance(mensagem, mensagens.NewUser):
+                resp = self.servidor.adicionar_usuario(mensagem)
+            elif isinstance(mensagem, mensagens.Msg):
+                resp = self.servidor.receber_mensagem(mensagem)
+            else:
+                resp = self.servidor.responder(mensagem)
             return (not resp.startswith("ERROR_")), resp
         return rede.enviar(ip, porta, str(mensagem))    
+    
+    def _difundir_lista_usuarios(self):
+        """Envia USERS_<id1>,<id2>,... aos servidores ativos para que conheçam os destinatários válidos."""
+        with self.lock:
+            todos_ids = sorted(self.usuarios_alocados.keys())
+            destinos = [
+                (sid, ip, porta)
+                for sid, (ip, porta, estado) in self.servidores.items()
+                if estado == "ativo" and sid != self.servidor.id
+            ]
+
+        if not todos_ids:
+            return
+
+        self.servidor.atualizar_usuarios_conhecidos(todos_ids)
+        if not destinos:
+            return
+
+        payload = str(mensagens.UserList(todos_ids))
+
+        def _enviar_para_todos():
+            for _, ip, porta in destinos:
+                rede.enviar(ip, porta, payload, timeout=1.5, tentativas=1)
+
+        threading.Thread(target=_enviar_para_todos, daemon=True).start()
     
     
     def _escolher_servidor_para_novo_usuario(self) -> tuple[str, int | None, tuple[str, int] | None]:
@@ -168,12 +191,7 @@ class Coordenador:
                 # Rollback do estado intermediário
                 if server_id in self.servidores and self.servidores[server_id][2] == "ativando":
                     self.servidores[server_id] = (ip, porta, "reserva")
-                logs.log_event(
-                    "falha_ativacao_servidor",
-                    servidor_id=server_id,
-                    cadastro=f"{config.CADASTRO_IP}:{config.CONTROL_PORT}",
-                    erro=info,
-                )
+                logs.log_event("falha_ativacao_servidor",servidor_id=server_id,cadastro=f"{config.CADASTRO_IP}:{config.CONTROL_PORT}",erro=info,)
                 print(f"[coordenador] Falha ao ativar servidor {server_id} no Cadastro: {info}")
                 return False
 
@@ -181,13 +199,7 @@ class Coordenador:
             self.ocupacao[server_id] = 1  # Já reserva a 1ª vaga para o usuário que disparou o scale-up
             ativos_total = sum(1 for _, _, st in self.servidores.values() if st == "ativo")
 
-        logs.log_event(
-            "servidor_ativado",
-            servidor_id=server_id,
-            ip=ip,
-            porta=porta,
-            ativos_total=ativos_total,
-        )
+        logs.log_event("servidor_ativado",servidor_id=server_id,ip=ip,porta=porta,ativos_total=ativos_total,)
         print(f"[coordenador] Servidor {server_id} ATIVADO ({ip}:{porta}) | Total ativos: {ativos_total}")
         return True
     
@@ -199,26 +211,7 @@ class Coordenador:
             if atual > 0:
                 self.ocupacao[server_id] = atual - 1
         
-    def tratar_mensagem(self, mensagem: mensagens.Mensagem) -> str | None:
-        """
-        Trata mensagens exclusivas do papel de coordenador.
-        Retorna a resposta ou None se a mensagem deve ser tratada pela camada comum do servidor.
-        """
-        match mensagem:
-            case mensagens.NewUser(user_id, nome):
-                logs.log_event("usuario_recebido", user_id=user_id, nome=nome)
-                return self.processar_novo_usuario(mensagem)
-
-            case mensagens.Kill(server_id):
-                logs.log_event("kill_recebido", server_id=server_id)
-                return str(mensagens.Ack(f"KILL_{server_id}"))
-
-            case mensagens.Register():
-                return self.registrar_servidor(mensagem)
-
-            case _:
-                return None
-            
+          
     def processar_novo_usuario(self, new_user: mensagens.NewUser) -> str:
         user_id = new_user.user_id
 
@@ -274,3 +267,65 @@ class Coordenador:
             servidor_destino=server_id,
         )
         return resp
+    
+    def rotear_mensagem(self, msg: mensagens.Msg) -> str:
+        """Consulta a tabela de alocação e encaminha MSG ao servidor do destinatário."""
+        with self.lock:
+            server_dest = self.usuarios_alocados.get(msg.dest_id)
+            dados_dest = self.servidores.get(server_dest) if server_dest is not None else None
+
+        if server_dest is None or dados_dest is None:
+            logs.log_event(
+                "msg_destino_desconhecido",
+                msg_id=msg.msg_id,
+                sender_id=msg.sender_id,
+                dest_id=msg.dest_id,
+            )
+            return str(mensagens.Error("USER_NOT_FOUND"))
+
+        ip_dest, porta_dest, estado = dados_dest
+        if estado != "ativo":
+            logs.log_event(
+                "msg_servidor_inativo",
+                msg_id=msg.msg_id,
+                sender_id=msg.sender_id,
+                dest_id=msg.dest_id,
+                servidor_destino=server_dest,
+                estado=estado,
+            )
+            return str(mensagens.Error("SERVER_UNAVAILABLE"))
+
+        logs.log_event("msg_roteada",msg_id=msg.msg_id,sender_id=msg.sender_id,dest_id=msg.dest_id,servidor_destino=server_dest,)
+
+        if server_dest == self.servidor.id:
+            return self.servidor.receber_mensagem(msg)
+
+        ok, resp = rede.enviar(ip_dest,porta_dest,str(msg),timeout=config.ACK_TIMEOUT, tentativas=config.MAX_ACK_RETRIES,)
+        if not ok:
+            logs.log_event("falha_entrega_msg",msg_id=msg.msg_id,sender_id=msg.sender_id,dest_id=msg.dest_id,servidor_destino=server_dest,erro=resp,)
+            return resp if resp.startswith("ERROR_") else str(mensagens.Error("DELIVERY_FAILED"))
+
+        return resp
+    
+    def tratar_mensagem(self, mensagem: mensagens.Mensagem) -> str | None:
+        """
+        Trata mensagens exclusivas do papel de coordenador.
+        Retorna a resposta ou None se a mensagem deve ser tratada pela camada comum do servidor.
+        """
+        match mensagem:
+            case mensagens.NewUser(user_id, nome):
+                logs.log_event("usuario_recebido", user_id=user_id, nome=nome)
+                return self.processar_novo_usuario(mensagem)
+
+            case mensagens.Msg():
+                return self.rotear_mensagem(mensagem)
+
+            case mensagens.Kill(server_id):
+                logs.log_event("kill_recebido", server_id=server_id)
+                return str(mensagens.Ack(f"KILL_{server_id}"))
+
+            case mensagens.Register():
+                return self.registrar_servidor(mensagem)
+
+            case _:
+                return None

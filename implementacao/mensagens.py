@@ -8,7 +8,8 @@ NEWCOORDINATORIP_RE = re.compile(r"NEWCOORDINATORIP_([A-Za-z0-9.:\-]+)_(\d{1,5})
 MSG_RE = re.compile(r"MSG_(\d{1,18})_(\d{1,18})_(\d{1,18})_(.+)", re.ASCII)
 ACK_RE = re.compile(r"ACK_([A-Z0-9_]+)", re.ASCII)
 ERROR_RE = re.compile(r"ERROR_([A-Z0-9_]+)", re.ASCII)
-REGISTER_RE = re.compile(r"REGISTER_(\d{1,18})_([A-Za-z0-9.:\-]+)_(\d{1,5})", re.ASCII)    
+REGISTER_RE = re.compile(r"REGISTER_(\d{1,18})_([A-Za-z0-9.:\-]+)_(\d{1,5})", re.ASCII) 
+USERS_RE = re.compile(r"USERS_(\d{1,18}(?:,\d{1,18})*)", re.ASCII)  
 
 class Mensagem():
     pass
@@ -68,7 +69,17 @@ class Register(Mensagem):
     def __str__(self):
         return f"REGISTER_{self.server_id}_{self.ip}_{self.port}"
     
+class UserList(Mensagem):
+    __match_args__ = ("user_ids",)
+    
+    def __init__(self, user_ids: list[int]):
+        self.user_ids = list(user_ids)
         
+    def __str__(self):
+        ids_str = ",".join(str(uid) for uid in self.user_ids)
+        return f"USERS_{ids_str}"
+
+       
 class Msg(Mensagem):
     __match_args__ = ("msg_id", "sender_id", "dest_id", "conteudo")
     
@@ -84,11 +95,11 @@ class Msg(Mensagem):
 class Ack(Mensagem):
     __match_args__ = ("msg_id",)
     
-    def __init__(self, param: int | str):
-        self.param = param
+    def __init__(self, referencia: int | str):
+        self.referencia = referencia
         
     def __str__(self):
-        return f"ACK_{self.param}"
+        return f"ACK_{self.referencia}"
 
 class Error(Mensagem):
     __match_args__ = ("descricao",)
@@ -107,6 +118,11 @@ def sanitize_name(name: str) -> str:
     name = "".join(ch if ch.isprintable() else " " for ch in name.replace("_", " "))
     return " ".join(name.split())
 
+def sanitize_content(content:str) -> str:
+    """Remove quebras de linha e caracteres de controle do conteúdo da mensagem."""
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in content)
+    return " ".join(cleaned.split())
+    
 def normalize_message(raw: str) -> Mensagem:
     """
     Valida e normaliza uma mensagem NEWUSER/KILL/NEWID/NEWCOORDINATORIP/MSG/ACK/ERROR.
@@ -162,22 +178,25 @@ def normalize_message(raw: str) -> Mensagem:
         
         return Register(server_id, ip, port)
     
+    m = USERS_RE.fullmatch(text)
+    if m:
+        user_ids = [int(x) for x in m.group(1).split(",")]
+        if any(uid <= 0 for uid in user_ids):
+            raise InvalidMessage("Todos os IDs de usuário devem ser maiores que zero")
+        return UserList(user_ids)
     
     m = MSG_RE.fullmatch(text)
     if m:
         msg_id, sender_id, dest_id = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        
-        if msg_id <= 0:
-            raise InvalidMessage("O ID da mensagem deve ser maior que zero")
-        elif sender_id <= 0:
-            raise InvalidMessage("O ID do remetente deve ser maior que zero")
-        elif dest_id <= 0:
-            raise InvalidMessage("O ID do destinatário deve ser maior que zero")
-        
-        conteudo = m.group(4)
-        
-        #TODO: fazer validações das mensagens
-        
+        if msg_id <= 0 or sender_id <= 0 or dest_id <= 0:
+            raise InvalidMessage("Os IDs da mensagem, remetente e destinatário devem ser maiores que zero")
+        conteudo = sanitize_content(m.group(4))
+        if not conteudo:
+            raise InvalidMessage("O conteúdo da mensagem não pode ficar vazio")
+        try:
+            conteudo.encode(config.ENCODING)
+        except UnicodeEncodeError:
+            raise InvalidMessage(f"O conteúdo tem caracteres que não existem em {config.ENCODING}")
         return Msg(msg_id, sender_id, dest_id, conteudo)
     
     m = ACK_RE.fullmatch(text)
@@ -194,7 +213,7 @@ def normalize_message(raw: str) -> Mensagem:
         
 
     raise InvalidMessage(
-            "Formato inválido. Use NEWUSER_<ID>[_<NOME>], KILL_<ID>, NEWID_<ID>, "
-            "NEWCOORDINATORIP_<IP>_<PORT>, REGISTER_<ID>_<IP>_<PORT>, "
-            "MSG_<MSG_ID>_<SENDER_ID>_<DEST_ID>_<CONTEUDO>, ACK_<REF> ou ERROR_<DESCRICAO>"
-        )
+        "Formato inválido. Use NEWUSER_<ID>[_<NOME>], KILL_<ID>, NEWID_<ID>, "
+        "NEWCOORDINATORIP_<IP>_<PORT>, REGISTER_<ID>_<IP>_<PORT>, USERS_<IDS>, "
+        "MSG_<MSG_ID>_<SENDER_ID>_<DEST_ID>_<CONTEUDO>, ACK_<REF> ou ERROR_<DESCRICAO>"
+    )
