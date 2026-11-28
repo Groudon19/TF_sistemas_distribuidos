@@ -25,7 +25,7 @@ def log_event( metrica: str, valor=1, **dados):
     """
     registro = {"ts": round(time.time(), 3), "componente": _componente, "id": _id,
                 "metrica": metrica, "valor": valor, **dados}
-    linha = json.dumps(registro, ensure_ascii=False) + "\n"
+    linha = json.dumps(registro, ensure_ascii=False, default=str) + "\n"
     with _log_lock:
         try:
             with _arquivo.open("a", encoding="utf-8") as f:

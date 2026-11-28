@@ -15,7 +15,7 @@ class Mensagem():
 class NewUser(Mensagem):
     __match_args__ = ("user_id", "nome")
     
-    def __init__(self, user_id: int, nome: str = None):
+    def __init__(self, user_id: int, nome: str | None = None):
         self.user_id = user_id
         self.nome = nome
         
