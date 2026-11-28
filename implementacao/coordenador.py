@@ -1,5 +1,8 @@
 import threading
+import subprocess
+import sys
 
+from pathlib import Path
 import config
 import logs
 import mensagens
@@ -19,6 +22,9 @@ class Coordenador:
         self.ocupacao: dict[int, int] = {servidor.id: 0}
         # Mapa global de usuários já confirmados: user_id -> server_id
         self.usuarios_alocados: dict[int, int] = {}
+        
+        self._eventos_registro: dict[int, threading.Event] = {}
+        self._processos_filhos: list[subprocess.Popen] = []
         
         
     def registrar_servidor(self, msg:mensagens.Register) -> str:
@@ -41,6 +47,11 @@ class Coordenador:
             estado = estado,
             total_servidores = total,
         )
+        
+        with self.lock:
+            evt = self._eventos_registro.pop(msg.server_id, None)
+        if evt is not None:
+            evt.set()
         
         print(f"[coordenador] Servidor {msg.server_id} registrado ({msg.ip}:{msg.port}) como '{estado}'")
         return str(mensagens.Ack(f"REGISTER_{msg.server_id}"))
@@ -87,7 +98,65 @@ class Coordenador:
                 self.servidores[sid] = (ip, porta, "ativando")
                 return "ativar", sid, (ip, porta)
 
-            return "cheio", None, None
+            return "criar", None, None
+    
+    def _criar_servidor_sob_demanda(self) -> tuple[bool, int | None, tuple[str, int] | None]:
+        """Lança um novo processo servidor.py localmente e aguarda seu REGISTER."""
+        with self.lock:
+            novo_id = max(self.servidores.keys(), default=self.servidor.id) + 1
+            portas_em_uso = {porta for _, porta, _ in self.servidores.values()}
+            nova_porta = self.servidor.port + novo_id
+            while nova_porta in portas_em_uso:
+                nova_porta += 1
+
+            novo_ip = self.servidor.ip
+            # Pré-reserva o ID como 'ativando' para nenhuma outra thread duplicar
+            self.servidores[novo_id] = (novo_ip, nova_porta, "ativando")
+            self.ocupacao[novo_id] = 0
+            evt = threading.Event()
+            self._eventos_registro[novo_id] = evt
+
+        script_servidor = Path(__file__).resolve().parent / "servidor.py"
+        cmd = [
+            sys.executable,
+            str(script_servidor),
+            "--id", str(novo_id),
+            "--ip", novo_ip,
+            "--porta", str(nova_porta),
+        ]
+
+        try:
+            proc = subprocess.Popen(cmd)
+            with self.lock:
+                self._processos_filhos.append(proc)
+        except OSError as exc:
+            with self.lock:
+                self.servidores.pop(novo_id, None)
+                self.ocupacao.pop(novo_id, None)
+                self._eventos_registro.pop(novo_id, None)
+            logs.log_event("falha_criacao_servidor", servidor_id=novo_id, erro=str(exc))
+            return False, None, None
+
+        logs.log_event("servidor_criado_sob_demanda", servidor_id=novo_id, ip=novo_ip, porta=nova_porta, pid=proc.pid)
+        print(f"[coordenador] Criando servidor {novo_id} sob demanda em {novo_ip}:{nova_porta} (PID {proc.pid})...")
+
+        if not evt.wait(timeout=5.0):
+            with self.lock:
+                self.servidores.pop(novo_id, None)
+                self.ocupacao.pop(novo_id, None)
+                self._eventos_registro.pop(novo_id, None)
+            logs.log_event("timeout_registro_sob_demanda", servidor_id=novo_id)
+            return False, None, None
+
+        return True, novo_id, (novo_ip, nova_porta)
+
+    def encerrar_filhos(self):
+        with self.lock:
+            filhos = list(self._processos_filhos)
+        for proc in filhos:
+            if proc.poll() is None:
+                proc.terminate()
+    
     
     def _ativar_servidor_reserva(self, server_id: int, ip: str, porta: int) -> bool:
         """Notifica o Cadastro com NEWID_<id> e efetiva a transição 'ativando' -> 'ativo'."""
@@ -166,16 +235,22 @@ class Coordenador:
         # 2. Alocação determinística ou scale-up
         acao, server_id, addr = self._escolher_servidor_para_novo_usuario()
 
-        if acao == "cheio" or server_id is None or addr is None:
-            logs.log_event("usuario_rejeitado_cluster_cheio", user_id=user_id, nome=new_user.nome)
-            return str(mensagens.Error("SERVER_FULL"))
-
-        ip_dest, porta_dest = addr
-
-        if acao == "ativar":
+        if acao == "criar":
+            ok_criacao, server_id, addr = self._criar_servidor_sob_demanda()
+            if not ok_criacao or server_id is None or addr is None:
+                logs.log_event("usuario_rejeitado_cluster_cheio", user_id=user_id, nome=new_user.nome)
+                return str(mensagens.Error("SERVER_FULL"))
+            ip_dest, porta_dest = addr
             if not self._ativar_servidor_reserva(server_id, ip_dest, porta_dest):
                 return str(mensagens.Error("CADASTRO_UNREACHABLE"))
-
+        else:
+            if acao == "cheio" or server_id is None or addr is None:
+                logs.log_event("usuario_rejeitado_cluster_cheio", user_id=user_id, nome=new_user.nome)
+                return str(mensagens.Error("SERVER_FULL"))
+            ip_dest, porta_dest = addr
+            if acao == "ativar":
+                if not self._ativar_servidor_reserva(server_id, ip_dest, porta_dest):
+                    return str(mensagens.Error("CADASTRO_UNREACHABLE"))
         # 3. Envia o usuário ao servidor responsável
         ok, resp = self._enviar_para_servidor(server_id, ip_dest, porta_dest, new_user)
         if not ok:

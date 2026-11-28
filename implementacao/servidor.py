@@ -96,6 +96,8 @@ class Servidor:
             rede.servir(self.port, self.processar, self.stop_event)
         except KeyboardInterrupt:
             self.stop_event.set()
+            if self.papel_coordenador is not None:
+                self.papel_coordenador.encerrar_filhos()
             print(f"\n[ok] Servidor {self.id} encerrado.")
                         
 
