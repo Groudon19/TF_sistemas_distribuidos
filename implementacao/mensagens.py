@@ -8,7 +8,8 @@ NEWCOORDINATORIP_RE = re.compile(r"NEWCOORDINATORIP_([A-Za-z0-9.:\-]+)_(\d{1,5})
 MSG_RE = re.compile(r"MSG_(\d{1,18})_(\d{1,18})_(\d{1,18})_(.+)", re.ASCII)
 ACK_RE = re.compile(r"ACK_(\d{1,18})", re.ASCII)
 ERROR_RE = re.compile(r"ERROR_([A-Z0-9_]+)", re.ASCII)
-    
+REGISTER_RE = re.compile(r"REGISTER_(\d{1,18})_([A-Za-z0-9.:\-]+)_(\d{1,5})", re.ASCII)    
+
 class Mensagem():
     pass
 
@@ -55,6 +56,18 @@ class NewCoordinatorIp(Mensagem):
         
     def __str__(self):
         return f"NEWCOORDINATORIP_{self.ip}_{self.port}"
+    
+class Register(Mensagem):
+    __match_args__ = ("server_id", "ip", "port")
+    
+    def __init__(self, server_id: int, ip: str, port: int):
+        self.server_id = server_id
+        self.ip = ip
+        self.port = port
+        
+    def __str__(self):
+        return f"REGISTER_{self.server_id}_{self.ip}_{self.port}"
+    
         
 class Msg(Mensagem):
     __match_args__ = ("msg_id", "sender_id", "dest_id", "conteudo")
@@ -139,6 +152,17 @@ def normalize_message(raw: str) -> Mensagem:
         
         return NewCoordinatorIp(ip, port)
     
+    m = REGISTER_RE.fullmatch(text)
+    if m:
+        server_id = int(m.group(1))
+        ip = m.group(2)
+        port = int(m.group(3))
+        if not (1 <= port <= 65535):
+            raise InvalidMessage(f"A porta deve estar entre 1 e 65535 (recebido: {port})")
+        
+        return Register(server_id, ip, port)
+    
+    
     m = MSG_RE.fullmatch(text)
     if m:
         msg_id, sender_id, dest_id = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -172,4 +196,8 @@ def normalize_message(raw: str) -> Mensagem:
         return Error(descricao)
         
 
-    raise InvalidMessage("Formato inválido. Use NEWUSER_<ID>_<NOME>, NEWUSER_<ID>, KILL_<ID>, NEWID_<ID>, NEWCOORDINATORIP_<IP>_<PORT>, MSG_<MSG_ID>_<SENDER_ID>_<DEST_ID>_<CONTEUDO>, ACK_<MSG_ID> ou ERROR_<DESCRICAO>")
+    raise InvalidMessage(
+            "Formato inválido. Use NEWUSER_<ID>[_<NOME>], KILL_<ID>, NEWID_<ID>, "
+            "NEWCOORDINATORIP_<IP>_<PORT>, REGISTER_<ID>_<IP>_<PORT>, "
+            "MSG_<MSG_ID>_<SENDER_ID>_<DEST_ID>_<CONTEUDO>, ACK_<REF> ou ERROR_<DESCRICAO>"
+        )
