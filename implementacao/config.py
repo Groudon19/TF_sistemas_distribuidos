@@ -63,6 +63,11 @@ if not SERVER_IP or not cfg("SERVER_PORT"):
     fail("SERVER_IP e SERVER_PORT são obrigatórias (.env ou variáveis de ambiente).")
 SERVER_PORT = cfg_int("SERVER_PORT", None, 1, 65535)
 
+# Endereço do Cadastro (para envio de NEWID / NEWCOORDINATORIP nas próximas etapas)
+CADASTRO_IP = cfg("CADASTRO_IP", SERVER_IP)
+CONTROL_HOST = cfg("CONTROL_HOST", "0.0.0.0")
+CONTROL_PORT = cfg_int("CONTROL_PORT", "6001", 1, 65535)
+
 ENCODING = cfg("ENCODING", "utf-8")
 try:
     codecs.lookup(ENCODING)
