@@ -13,6 +13,8 @@ class Mensagem():
     pass
 
 class NewUser(Mensagem):
+    __match_args__ = ("user_id", "nome")
+    
     def __init__(self, user_id: int, nome: str = None):
         self.user_id = user_id
         self.nome = nome
@@ -27,6 +29,8 @@ class NewUser(Mensagem):
             return f"NEWUSER_{self.user_id}_{self.nome}"
 
 class Kill(Mensagem):
+    __match_args__ = ("server_id",)
+
     def __init__(self, server_id: int):
         self.server_id = server_id
         
@@ -34,6 +38,8 @@ class Kill(Mensagem):
         return f"KILL_{self.server_id}"
         
 class NewId(Mensagem):
+    __match_args__ = ("server_id",)
+    
     def __init__(self, server_id: int):
         self.server_id = server_id
         
@@ -41,6 +47,8 @@ class NewId(Mensagem):
         return f"NEWID_{self.server_id}"
 
 class NewCoordinatorIp(Mensagem):
+    __match_args__ = ("ip", "port")
+    
     def __init__(self, ip: str, port: int):
         self.ip = ip
         self.port = port
@@ -49,6 +57,8 @@ class NewCoordinatorIp(Mensagem):
         return f"NEWCOORDINATORIP_{self.ip}_{self.port}"
         
 class Msg(Mensagem):
+    __match_args__ = ("msg_id", "sender_id", "dest_id", "conteudo")
+    
     def __init__(self, msg_id: int, sender_id: int, dest_id: int, conteudo: str):
         self.msg_id = msg_id
         self.sender_id = sender_id
@@ -59,6 +69,8 @@ class Msg(Mensagem):
         return f"MSG_{self.msg_id}_{self.sender_id}_{self.dest_id}_{self.conteudo}"
     
 class Ack(Mensagem):
+    __match_args__ = ("msg_id",)
+    
     def __init__(self, msg_id: int):
         self.msg_id = msg_id
         
@@ -66,6 +78,8 @@ class Ack(Mensagem):
         return f"ACK_{self.msg_id}"
 
 class Error(Mensagem):
+    __match_args__ = ("descricao",)
+    
     def __init__(self, descricao: str):
         self.descricao = descricao
     

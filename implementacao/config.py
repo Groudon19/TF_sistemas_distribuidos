@@ -88,6 +88,3 @@ MAX_MSG_INTERVAL = cfg_float("MAX_MSG_INTERVAL", "10", 0.1)
 RECEIVE_MSG_DELAY = cfg_float("RECEIVE_MSG_DELAY", "1", 0)
 ACK_TIMEOUT = cfg_float("ACK_TIMEOUT", "3", 0.1)
 MAX_ACK_RETRIES = cfg_int("MAX_ACK_RETRIES", "3", 1)
-
-def define_log_file():
-    pass

@@ -2,21 +2,33 @@
 import json
 import time
 import threading
-import config
+
+from pathlib import Path
 
 _log_lock = threading.Lock()
 
-def log_event(componente: str, id: int, metrica: str, valor=1, **dados):
+_arquivo = None
+_componente = None
+_id = None
+
+def init_log(arquivo: Path, componente: str, id: int):
+    global _arquivo, _componente, _id
+    _arquivo = Path(arquivo)
+    _componente = componente
+    _id = id
+    _arquivo.parent.mkdir(parents=True, exist_ok=True)
+
+def log_event( metrica: str, valor=1, **dados):
     """
     Registra em JSON Lines no formato do enunciado:
     {"ts", "componente", "id", "metrica", "valor"} + campos de detalhe.
     """
-    registro = {"ts": round(time.time(), 3), "componente": componente, "id": id,
+    registro = {"ts": round(time.time(), 3), "componente": _componente, "id": _id,
                 "metrica": metrica, "valor": valor, **dados}
     linha = json.dumps(registro, ensure_ascii=False) + "\n"
     with _log_lock:
         try:
-            with config.LOG_FILE.open("a", encoding="utf-8") as f:
+            with _arquivo.open("a", encoding="utf-8") as f:
                 f.write(linha)
         except OSError as exc:
             print(f"[aviso] não foi possível gravar o log: {exc}")
