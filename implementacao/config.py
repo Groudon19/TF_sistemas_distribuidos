@@ -74,10 +74,6 @@ try:
 except LookupError:
     fail(f"ENCODING desconhecido: {ENCODING!r}.")
 
-# Endereço em que o Cadastro recebe NEWID / NEWCOORDINATORIP (opcional no .env).
-CONTROL_HOST = cfg("CONTROL_HOST", "0.0.0.0")
-CONTROL_PORT = cfg_int("CONTROL_PORT", "6001", 1, 65535)
-
 # ID do primeiro servidor (o coordenador inicial), que já começa na lista.
 INITIAL_SERVER_ID = cfg_int("INITIAL_SERVER_ID", "0", 0)
 

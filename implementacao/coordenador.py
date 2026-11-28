@@ -15,7 +15,7 @@ class Coordenador:
     def registrar_servidor(self, msg:mensagens.Register) -> str:
         with self.lock:
             estado_atual = self.servidores.get(msg.server_id)
-            if estado_atual is not None or estado_atual[2] == "ativo":
+            if estado_atual is not None and estado_atual[2] == "ativo":
                 estado = "ativo"
             else:
                 estado = "reserva"
@@ -29,7 +29,7 @@ class Coordenador:
             ip = msg.ip,
             porta = msg.port,
             estado = estado,
-            total_servidor = total,
+            total_servidores = total,
         )
         
         print(f"[coordenador] Servidor {msg.server_id} registrado ({msg.ip}:{msg.port}) como '{estado}'")

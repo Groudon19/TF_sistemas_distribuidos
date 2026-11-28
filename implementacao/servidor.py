@@ -1,6 +1,4 @@
 import argparse
-import socket
-import traceback
 import threading
 import time
 
@@ -75,25 +73,7 @@ class Servidor:
             logs.log_event("mensagem_invalida", linha=texto, erro=str(e))
             return str(mensagens.Error("INVALID_COMMAND"))
         return self.responder(mensagem)
-        
-    def atender(self, conn: socket.socket, addr: tuple):
-        with conn:
-            try:
-                arquivo = conn.makefile("rb")
-                for linha in arquivo:
-                    texto = linha.decode(config.ENCODING, errors="replace").strip()
-                    if not texto:
-                        continue
-                    try:
-                        resposta = self.processar(texto)
-                    except Exception as e:
-                        logs.log_event("erro_interno", linha=texto, erro=f"{type(e).__name__}: {e}")
-                        traceback.print_exec()
-                        resposta = str(mensagens.Error("INTERNAL"))
-                    conn.sendall((resposta + "\n").encode(config.ENCODING))
-            except OSError as e:
-                logs.log_event("erro_conexao", origem=f"{addr[0]}:{addr[1]}", erro=str(e))
-    
+            
     def registrar_no_coordenador(self):
         """Envia REGISTER_<ID>_<IP>_<PORTA> ao coordenador inicial após abrir o socket."""
         time.sleep(0.2)

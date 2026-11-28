@@ -6,7 +6,7 @@ KILL_RE = re.compile(r"KILL_(\d{1,18})", re.ASCII)
 NEWID_RE = re.compile(r"NEWID_(\d{1,18})", re.ASCII)
 NEWCOORDINATORIP_RE = re.compile(r"NEWCOORDINATORIP_([A-Za-z0-9.:\-]+)_(\d{1,5})", re.ASCII)
 MSG_RE = re.compile(r"MSG_(\d{1,18})_(\d{1,18})_(\d{1,18})_(.+)", re.ASCII)
-ACK_RE = re.compile(r"ACK_(\d{1,18})", re.ASCII)
+ACK_RE = re.compile(r"ACK_([A-Z0-9_]+)", re.ASCII)
 ERROR_RE = re.compile(r"ERROR_([A-Z0-9_]+)", re.ASCII)
 REGISTER_RE = re.compile(r"REGISTER_(\d{1,18})_([A-Za-z0-9.:\-]+)_(\d{1,5})", re.ASCII)    
 
@@ -84,11 +84,11 @@ class Msg(Mensagem):
 class Ack(Mensagem):
     __match_args__ = ("msg_id",)
     
-    def __init__(self, msg_id: int):
-        self.msg_id = msg_id
+    def __init__(self, param: int | str):
+        self.param = param
         
     def __str__(self):
-        return f"ACK_{self.msg_id}"
+        return f"ACK_{self.param}"
 
 class Error(Mensagem):
     __match_args__ = ("descricao",)
